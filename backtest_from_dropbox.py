@@ -1,29 +1,25 @@
 # backtest_from_dropbox.py
-# Çalıştır: streamlit run backtest_from_dropbox.py
-# Gerekli paketler (requirements.txt):
-#   streamlit==1.36.0
-#   pandas==2.2.2
-#   numpy==1.26.4
-#   requests==2.32.3
-#   fastparquet
+# Çalıştırma: streamlit run backtest_from_dropbox.py
 #
 # Notlar:
-# - Parquet okumak için pyarrow şart değil; fastparquet yeterli.
-# - Dropbox linkleri "Anyone with the link can view" olmalı. Kod dl=0 -> dl=1 çevirir.
+# - Veriler tek Parquet dosyasında (BTC/ETH + 5m/1h/1w/1M) olduğundan,
+#   symbol & timeframe filtreleri ile doğru dilim seçilir.
+# - Dropbox linki "Anyone with the link can view" olmalı.
+# - Kod dl=0 -> dl=1'e çevirerek direkt indirme yapar.
+# - Cache dizini /tmp, Streamlit Cloud'da yazılabilir.
 
 import os
 import time
-import math
-import hashlib
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+import tempfile
 from typing import Tuple
 
 st.set_page_config(page_title="BTC/ETH Backtest (Dropbox Parquet)", layout="wide")
 
-# ----- Kullanacağımız iki link (senin verdiğinler) -----
+# ----- Senin verdiğin linkler (gerekirse UI'dan değiştirirsin) -----
 DEFAULT_FUTURES_URL = (
     "https://www.dropbox.com/scl/fi/diznny37aq4t88vf62umy/"
     "binance_futures_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet"
@@ -35,21 +31,19 @@ DEFAULT_SPOT_URL = (
     "?rlkey=swsjkpbp22v4vj68ggzony8yw&st=2sww3kao&dl=0"
 )
 
-DATA_DIR = "/mount/data/dropbox_cache"
+# Yazılabilir cache
+DATA_DIR = os.path.join(tempfile.gettempdir(), "dropbox_cache")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ---------- Yardımcılar ----------
 def to_direct_link(url: str) -> str:
-    """Dropbox paylaşım linkini doğrudan indirme (dl=1) formatına çevirir."""
-    if "dropbox.com" in url:
-        if "dl=0" in url:
-            url = url.replace("dl=0", "dl=1")
-        # Ek olarak domain dönüşümü de yapabiliriz (gerekirse):
-        # url = url.replace("www.dropbox.com", "dl.dropboxusercontent.com")
+    """Dropbox linkini doğrudan indirme (dl=1) formatına çevir."""
+    if "dropbox.com" in url and "dl=0" in url:
+        url = url.replace("dl=0", "dl=1")
     return url
 
 def stream_download(url: str, dst_path: str, chunk=1024*1024, timeout=120):
-    """Dosyayı akış halinde indirir; HTTP hatalarında exception fırlatır."""
+    """Akış halinde indir; HTTP sorununda exception üret."""
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length") or 0)
@@ -67,13 +61,10 @@ def stream_download(url: str, dst_path: str, chunk=1024*1024, timeout=120):
         st.success(f"İndirme tamamlandı: {downloaded/1e6:.1f} MB, {time.time()-t0:.1f} sn")
 
 def ensure_local_copy(name: str, url: str) -> str:
-    """
-    Yerelde yoksa indirir, varsa kullanır.
-    - HTTP/bağlantı/erişim hatalarında exception fırlatır (UI yakalar).
-    """
+    """Cache'de yoksa indir; varsa aynen kullan."""
     local_path = os.path.join(DATA_DIR, name)
     if not os.path.exists(local_path):
-        st.info("Yerelde bulunamadı, Dropbox’tan indiriliyor…")
+        st.info("Yerelde yok, Dropbox’tan indiriliyor…")
         direct = to_direct_link(url)
         stream_download(direct, local_path)
     else:
@@ -83,11 +74,11 @@ def ensure_local_copy(name: str, url: str) -> str:
 @st.cache_data(show_spinner=False)
 def load_parquet(local_path: str) -> pd.DataFrame:
     """
-    Parquet'i okur; DatetimeIndex (UTC) kurar; zorunlu kolonları doğrular.
-    Beklenen kolonlar: open, high, low, close, volume, symbol, timeframe (+ timestamp veya DatetimeIndex)
+    Parquet'i oku; DatetimeIndex (UTC) kur; zorunlu kolonları kontrol et.
+    Beklenen kolonlar: open, high, low, close, volume, symbol, timeframe
+    + ya DatetimeIndex ya da 'timestamp'
     """
-    df = pd.read_parquet(local_path)  # engine="auto" -> fastparquet kullanılacak
-    # Zaman indeksini hazırla
+    df = pd.read_parquet(local_path)  # fastparquet kullanacağız (requirements'ta var)
     if not isinstance(df.index, pd.DatetimeIndex):
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -100,7 +91,6 @@ def load_parquet(local_path: str) -> pd.DataFrame:
     else:
         df.index = df.index.tz_convert("UTC")
 
-    # Zorunlu kolonlar
     needed = {"open","high","low","close","volume","symbol","timeframe"}
     missing = [c for c in needed if c not in df.columns]
     if missing:
@@ -144,9 +134,9 @@ def make_signals(df: pd.DataFrame,
                  pullback_atr_thresh=0.5,
                  regime_filter=None) -> pd.DataFrame:
     """
-    Basit kural seti:
-    - EMA hizası: bull => EMAfast>EMA13>EMA26; bear => ters.
-    - Pullback: |close-EMA_mid|/ATR < eşik
+    Basit kural:
+    - EMA hizası: bull => EMAfast>EMA13>EMA26; bear => tersi
+    - Pullback: |close-EMA13| / ATR < eşik
     - Engulfing: yönle uyumlu
     - regime_filter: 'long-only', 'short-only' ya da None
     """
@@ -190,8 +180,7 @@ def backtest(df: pd.DataFrame,
              risk_pct=0.02,
              leverage=10.0) -> Tuple[pd.DataFrame, dict, pd.DataFrame]:
     """
-    Basitleştirilmiş motor:
-    - Sinyal mumunun kapanışı sonrası bir sonraki barın açılışında giriş.
+    - Sinyal mumu kapandıktan sonra bir sonraki bar açılışında giriş.
     - SL = ATR * atr_stop_mult; TP = rr * SL
     - Aynı anda tek pozisyon (one_trade_at_a_time=True).
     - Komisyon: nominal * fee_rate (açılış + kapanış).
@@ -248,7 +237,7 @@ def backtest(df: pd.DataFrame,
 
             exit_price = None; result = None
             if tp_hit and sl_hit:
-                result = "SL_first"; exit_price = sl   # konservatif
+                result = "SL_first"; exit_price = sl   # konservatif varsayım
             elif tp_hit:
                 result = "TP"; exit_price = tp
             elif sl_hit:
@@ -334,7 +323,7 @@ if run_btn:
     try:
         local_path = ensure_local_copy(local_name, use_url)
     except requests.HTTPError as e:
-        st.error(f"HTTP hatası: {e}. Linki ve paylaşım ayarını kontrol et (dl=1).")
+        st.error(f"HTTP hatası: {e}. Link ve paylaşım ayarını kontrol et (dl=1).")
         st.stop()
     except requests.RequestException as e:
         st.error(f"Ağ hatası: {e}")
@@ -352,7 +341,7 @@ if run_btn:
 
     st.success(f"Yüklendi: {len(big):,} satır | Semboller: {sorted(big['symbol'].unique())} | TF: {sorted(big['timeframe'].unique())}")
 
-    # 3) Filtrele (tek dosyada çok TF/symbol olduğu için burada sorun yok)
+    # 3) Filtrele
     view = big[(big["symbol"] == wanted_symbol) & (big["timeframe"] == wanted_tf)].copy()
     if view.empty:
         st.error("Seçilen sembol/timeframe için veri bulunamadı.")
