@@ -1,12 +1,6 @@
 # backtest_from_dropbox.py
 # Çalıştırma: streamlit run backtest_from_dropbox.py
-# Gerekenler: streamlit, pandas, numpy, requests, fastparquet
-# Notlar:
-# - Veriler tek Parquet içinde: kolonlar ['open','high','low','close','volume','symbol','timeframe', ...]
-# - Zorunlu trend koşulları: 5m EMA7>13>26 (long) / 7<13<26 (short) + aynı anda 1h EMA7>13 (long) / 7<13 (short)
-# - LRC tetikleyici "ek koşul" olarak checkbox ile açılır (Long: close>LRC_HIGH; Short: close<LRC_LOW)
-# - Dönem seçimi, streak metrikleri, CSV kayıt/indirme var.
-# - Dosya indirme/cache: /tmp/dropbox_cache ; CSV çıktı: /tmp/backtest_exports
+# Gerekenler: streamlit, pandas, numpy, requests, fastparquet, plotly
 
 import os
 import io
@@ -19,10 +13,11 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="LRC + EMA Backtest (5m+1h)", layout="wide")
 
-# ---------- KULLANICI LİNKLERİ (senin verdiğin) ----------
+# ---------- KULLANICI LİNKLERİ ----------
 DEFAULT_FUTURES_URL = (
     "https://www.dropbox.com/scl/fi/diznny37aq4t88vf62umy/"
     "binance_futures_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet"
@@ -73,14 +68,13 @@ def ensure_local_copy(name: str, url: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_parquet(local_path: str) -> pd.DataFrame:
-    df = pd.read_parquet(local_path)  # fastparquet
+    df = pd.read_parquet(local_path)  # fastparquet olmalı
     if not isinstance(df.index, pd.DatetimeIndex):
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
             df = df.set_index("timestamp")
         else:
             raise ValueError("DatetimeIndex yok ve 'timestamp' kolonu bulunamadı.")
-    # UTC
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     else:
@@ -109,10 +103,9 @@ def is_engulfing(df: pd.DataFrame, bullish=True) -> pd.Series:
     o,c,h,l = df["open"], df["close"], df["high"], df["low"]
     po, pc, ph, pl = o.shift(1), c.shift(1), h.shift(1), l.shift(1)
     if bullish:
-        cond = (pc < po) & (c > o) & (h > ph) & (l < pl)
+        cond = (pc < po) & (c > o) & (h >= ph) & (l <= pl)
     else:
-        cond = (pc > po) & (c < o) & (h < pl) & (l > pl)  # düzeltme: bearish engulf tanımı
-        cond = (pc > po) & (c < o) & (h < ph) & (l > pl)
+        cond = (pc > po) & (c < o) & (h <= ph) & (l >= pl)
     return cond.fillna(False)
 
 # ---------- Swing ve Pip ----------
@@ -121,9 +114,7 @@ def estimate_tick(close: pd.Series) -> float:
     diffs = diffs[diffs > 0]
     if diffs.empty:
         return 0.01
-    # En küçük anlamlı adımı tahmin: alt persentil
     guess = diffs.quantile(0.1)
-    # Normalleştir (1-2-5 ölçeği)
     exp = math.floor(math.log10(guess)) if guess > 0 else -2
     base = guess / (10 ** exp)
     for b in [1,2,5,10]:
@@ -133,13 +124,12 @@ def estimate_tick(close: pd.Series) -> float:
     return max(step, 1e-6)
 
 def last_swing_low(high: pd.Series, low: pd.Series, lookback: int = 5) -> pd.Series:
-    # basit: son N barın en düşüğü, ama "son" swing'i almak için shift(1)
     return low.shift(1).rolling(lookback, min_periods=1).min()
 
 def last_swing_high(high: pd.Series, low: pd.Series, lookback: int = 5) -> pd.Series:
     return high.shift(1).rolling(lookback, min_periods=1).max()
 
-# ---------- LRC (AYNEN SENİN KODUN) ----------
+# ---------- LRC (senin kodun) ----------
 def _lrc_last_point(values: np.ndarray) -> float:
     w = np.asarray(values, dtype=float).ravel()
     n = w.size
@@ -174,76 +164,66 @@ def price_position_vs_lrc(close: pd.Series, lrc_high: pd.Series, lrc_low: pd.Ser
     return out
 
 # ---------- Sinyal üretimi ----------
-def prepare_timeframes(big: pd.DataFrame, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df5 = big[(big["symbol"] == symbol) & (big["timeframe"] == "5m")][["open","high","low","close","volume"]].copy()
-    df1h = big[(big["symbol"] == symbol) & (big["timeframe"] == "1h")][["open","high","low","close","volume"]].copy()
-    return df5.sort_index(), df1h.sort_index()
+def split_timeframes(big: pd.DataFrame, symbol: str):
+    df5_full = big[(big["symbol"] == symbol) & (big["timeframe"] == "5m")][["open","high","low","close","volume"]].copy()
+    df1h_full = big[(big["symbol"] == symbol) & (big["timeframe"] == "1h")][["open","high","low","close","volume"]].copy()
+    return df5_full.sort_index(), df1h_full.sort_index()
 
-def enforce_ema_conditions(df5: pd.DataFrame, df1h: pd.DataFrame) -> pd.DataFrame:
-    # 5m EMAs (sabit)
-    df5["ema7"]  = ema(df5["close"], 7)
-    df5["ema13"] = ema(df5["close"], 13)
-    df5["ema26"] = ema(df5["close"], 26)
-    df5["ATR"]   = atr(df5, 14)
+def compute_indicators_full(df5_full: pd.DataFrame, df1h_full: pd.DataFrame, lrc_length: int):
+    # 5m EMA/ATR (tüm veri)
+    df5_full["ema7"]  = ema(df5_full["close"], 7)
+    df5_full["ema13"] = ema(df5_full["close"], 13)
+    df5_full["ema26"] = ema(df5_full["close"], 26)
+    df5_full["ATR"]   = atr(df5_full, 14)
 
-    # 1h EMAs (sabit)
-    df1h["ema7"]  = ema(df1h["close"], 7)
-    df1h["ema13"] = ema(df1h["close"], 13)
-    h1 = df1h[["ema7","ema13"]].copy()
+    # 1h EMA (tüm veri)
+    df1h_full["ema7"]  = ema(df1h_full["close"], 7)
+    df1h_full["ema13"] = ema(df1h_full["close"], 13)
 
-    # 1h değerlerini 5m zamana eşle
+    # 5m LRC bantları (tüm veri)
+    lrc = compute_lrc_bands(df5_full, length=lrc_length)
+    df5_full["lrc_high"] = lrc["lrc_high"]
+    df5_full["lrc_low"]  = lrc["lrc_low"]
+    pos = price_position_vs_lrc(df5_full["close"], df5_full["lrc_high"], df5_full["lrc_low"])
+    df5_full["lrc_mid"]   = pos["band_mid"]
+    df5_full["lrc_width"] = (df5_full["lrc_high"] - df5_full["lrc_low"]) / df5_full["ATR"].replace(0, np.nan)
+    return df5_full, df1h_full
+
+def align_1h_to_5m(df5: pd.DataFrame, df1h_full: pd.DataFrame) -> pd.DataFrame:
+    h1 = df1h_full[["ema7","ema13"]].copy()
     h1_aligned = h1.reindex(df5.index, method="ffill")
     df5["h1_ema7"]  = h1_aligned["ema7"]
     df5["h1_ema13"] = h1_aligned["ema13"]
-
-    # Zorunlu trend koşulları
-    df5["bull5"] = (df5["ema7"] > df5["ema13"]) & (df5["ema13"] > df5["ema26"])
-    df5["bear5"] = (df5["ema7"] < df5["ema13"]) & (df5["ema13"] < df5["ema26"])
-    df5["bull1h"] = (df5["h1_ema7"] > df5["h1_ema13"])
-    df5["bear1h"] = (df5["h1_ema7"] < df5["h1_ema13"])
     return df5
 
-def make_signals(
-    df5: pd.DataFrame,
-    use_lrc_trigger: bool = True,
-    lrc_length: int = 300,
-    use_pullback: bool = False,
-    pullback_thr: float = 0.5,
-    use_engulf: bool = False,
-    use_lrc_chop: bool = False,
-    lrc_chop_min: float = 1.0
-) -> pd.DataFrame:
+def make_signals(df5: pd.DataFrame,
+                 use_lrc_trigger: bool,
+                 use_pullback: bool,
+                 pullback_thr: float,
+                 use_engulf: bool,
+                 use_lrc_chop: bool,
+                 lrc_chop_min: float) -> pd.DataFrame:
     out = df5.copy()
+    # Zorunlu EMA trend koşulları
+    out["bull5"]  = (out["ema7"] > out["ema13"]) & (out["ema13"] > out["ema26"])
+    out["bear5"]  = (out["ema7"] < out["ema13"]) & (out["ema13"] < out["ema26"])
+    out["bull1h"] = (out["h1_ema7"] > out["h1_ema13"])
+    out["bear1h"] = (out["h1_ema7"] < out["h1_ema13"])
 
-    # LRC bantları (5m)
-    if use_lrc_trigger or use_lrc_chop:
-        bands = compute_lrc_bands(out, length=lrc_length)
-        out["lrc_high"] = bands["lrc_high"]
-        out["lrc_low"]  = bands["lrc_low"]
-        pos = price_position_vs_lrc(out["close"], out["lrc_high"], out["lrc_low"])
-        out["lrc_mid"]  = pos["band_mid"]
-        out["lrc_width"] = (out["lrc_high"] - out["lrc_low"]) / out["ATR"].replace(0, np.nan)
-
-    # Ek filtreler
     pull_ok = pd.Series(True, index=out.index)
-    eng_ok  = pd.Series(True, index=out.index)
+    eng_bull = pd.Series(True, index=out.index)
+    eng_bear = pd.Series(True, index=out.index)
     chop_ok = pd.Series(True, index=out.index)
 
     if use_pullback:
         dist = (out["close"] - out["ema13"]).abs() / out["ATR"].replace(0, np.nan)
         pull_ok = dist <= pullback_thr
-
     if use_engulf:
-        bull_eng = is_engulfing(out, bullish=True)
-        bear_eng = is_engulfing(out, bullish=False)
-    else:
-        bull_eng = pd.Series(True, index=out.index)
-        bear_eng = pd.Series(True, index=out.index)
-
+        eng_bull = is_engulfing(out, bullish=True)
+        eng_bear = is_engulfing(out, bullish=False)
     if use_lrc_chop:
         chop_ok = out["lrc_width"] >= lrc_chop_min
 
-    # Zorunlu EMA koşulları + (opsiyonel) LRC tetikleyici
     base_long  = out["bull5"] & out["bull1h"]
     base_short = out["bear5"] & out["bear1h"]
 
@@ -253,8 +233,8 @@ def make_signals(
         base_long  = base_long  & long_trg
         base_short = base_short & short_trg
 
-    out["long_signal"]  = base_long  & pull_ok & chop_ok & bull_eng
-    out["short_signal"] = base_short & pull_ok & chop_ok & bear_eng
+    out["long_signal"]  = base_long  & pull_ok & chop_ok & eng_bull
+    out["short_signal"] = base_short & pull_ok & chop_ok & eng_bear
     return out
 
 # ---------- Backtest ----------
@@ -263,7 +243,6 @@ def backtest(
     rr: float = 2.0,
     atr_stop_mult: float = 2.0,
     entry_offset_bps: float = 0.0,
-    one_trade_at_a_time: bool = True,
     fee_rate: float = 0.0004,
     initial_equity: float = 1000.0,
     risk_mode: str = "dynamic",   # "dynamic" | "fixed"
@@ -274,16 +253,13 @@ def backtest(
     swing_lookback: int = 5,
     pip_override: Optional[float] = None,
     cooldown_bars: int = 0
-) -> Tuple[pd.DataFrame, dict, pd.DataFrame]:
+):
     o,h,l,c = df["open"], df["high"], df["low"], df["close"]
     atrv = df["ATR"].fillna(method="bfill").fillna(method="ffill")
     long_sig  = df["long_signal"].fillna(False)
     short_sig = df["short_signal"].fillna(False)
 
-    # Pip adımı
     pip_step = pip_override if (pip_override and pip_override > 0) else estimate_tick(c)
-
-    # Swing seviyeleri
     sw_low  = last_swing_low(df["high"], df["low"], lookback=swing_lookback)
     sw_high = last_swing_high(df["high"], df["low"], lookback=swing_lookback)
 
@@ -306,12 +282,10 @@ def backtest(
 
     for i in range(2, len(df)):
         ts = df.index[i]
-
         if cooldown_left > 0:
             cooldown_left -= 1
 
         if not in_pos and cooldown_left == 0:
-            # girişler: bir önceki barın kapanan sinyali
             if long_sig.iloc[i-1]:
                 ent = o.iloc[i] * off_mult_up
                 sl_dist_atr = atrv.iloc[i] * atr_stop_mult
@@ -325,10 +299,8 @@ def backtest(
                 side = "long"; in_pos = True
                 qty, nominal = position_size(entry_price)
                 fee_open = nominal * fee_rate
-                trades.append({
-                    "time": ts, "side": side, "entry": entry_price, "sl": sl, "tp": tp,
-                    "qty": qty, "nominal": nominal, "fee_open": fee_open
-                })
+                trades.append({"time": ts, "side": side, "entry": entry_price, "sl": sl, "tp": tp,
+                               "qty": qty, "nominal": nominal, "fee_open": fee_open})
             elif short_sig.iloc[i-1]:
                 ent = o.iloc[i] * off_mult_down
                 sl_dist_atr = atrv.iloc[i] * atr_stop_mult
@@ -342,19 +314,15 @@ def backtest(
                 side = "short"; in_pos = True
                 qty, nominal = position_size(entry_price)
                 fee_open = nominal * fee_rate
-                trades.append({
-                    "time": ts, "side": side, "entry": entry_price, "sl": sl, "tp": tp,
-                    "qty": qty, "nominal": nominal, "fee_open": fee_open
-                })
+                trades.append({"time": ts, "side": side, "entry": entry_price, "sl": sl, "tp": tp,
+                               "qty": qty, "nominal": nominal, "fee_open": fee_open})
         else:
-            # poz yönetimi
             hi, lo = h.iloc[i], l.iloc[i]
             tp_hit = (hi >= tp) if side == "long" else (lo <= tp)
             sl_hit = (lo <= sl) if side == "long" else (hi >= sl)
 
             exit_price = None; result = None
             if tp_hit and sl_hit:
-                # konservatif: önce SL
                 result = "SL_first"; exit_price = sl
             elif tp_hit:
                 result = "TP"; exit_price = tp
@@ -367,10 +335,8 @@ def backtest(
                 pnl = (exit_price - entry_price) * qty if side == "long" else (entry_price - exit_price) * qty
                 net = pnl - (last["fee_open"] + fee_close)
                 equity += net
-                last.update({
-                    "exit_time": ts, "exit": exit_price, "result": result,
-                    "pnl": pnl, "net": net, "fee_close": fee_close, "equity_after": equity
-                })
+                last.update({"exit_time": ts, "exit": exit_price, "result": result,
+                             "pnl": pnl, "net": net, "fee_close": fee_close, "equity_after": equity})
                 in_pos = False; side = None; entry_price = sl = tp = np.nan
                 if cooldown_bars > 0:
                     cooldown_left = cooldown_bars
@@ -380,20 +346,18 @@ def backtest(
     trades_df = pd.DataFrame(trades)
     eq_df = pd.DataFrame(eq_curve, columns=["time","equity"]).set_index("time")
 
-    # Metrikler + Streak
     if trades_df.empty:
-        stats = {"trades": 0, "winrate": 0.0, "net_total": 0.0,
-                 "max_dd": 0.0, "final_equity": float(equity),
+        stats = {"trades": 0, "winrate": 0.0, "net_total": 0.0, "max_dd": 0.0,
+                 "final_equity": float(equity),
                  "max_win_streak": 0, "max_loss_streak": 0}
     else:
-        wins = (trades_df["net"] > 0).astype(int)
-        losses = (trades_df["net"] <= 0).astype(int)
+        wins = (trades_df["net"] > 0)
+        losses = ~wins
 
-        def max_streak(mask: pd.Series) -> Tuple[int, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-            # True/False seride en uzun True bloğu
+        def max_streak(mask: pd.Series):
             max_len = 0; cur = 0; start = None; best = (0, None, None)
             idx = trades_df["exit_time"].reset_index(drop=True)
-            for k, v in enumerate(mask):
+            for k, v in enumerate(mask.fillna(False)):
                 if v:
                     cur += 1
                     if cur == 1:
@@ -405,21 +369,21 @@ def backtest(
                     cur = 0; start = None
             return best
 
-        win_best = max_streak(wins.astype(bool))
-        loss_best = max_streak(losses.astype(bool))
+        win_best = max_streak(wins)
+        loss_best = max_streak(losses)
 
-        net_total = trades_df["net"].sum()
+        net_total = float(trades_df["net"].sum())
         winrate = 100.0 * wins.sum() / len(trades_df)
-        eq = eq_df["equity"].fillna(method="ffill").fillna(initial_equity)
+        eq = eq_df["equity"].fillna(method="ffill")
         peak = eq.cummax()
         dd = (eq - peak) / peak
         max_dd = float(dd.min() * 100.0)
         stats = {
             "trades": int(len(trades_df)),
             "winrate": float(winrate),
-            "net_total": float(net_total),
+            "net_total": net_total,
             "max_dd": max_dd,
-            "final_equity": float(eq.iloc[-1]),
+            "final_equity": float(eq.iloc[-1]) if len(eq) else float(equity),
             "max_win_streak": int(win_best[0]),
             "max_win_streak_start": win_best[1],
             "max_win_streak_end": win_best[2],
@@ -439,13 +403,13 @@ with st.sidebar:
     spot_url = st.text_input("Spot URL", value=DEFAULT_SPOT_URL)
 
     st.subheader("Seçimler")
-    symbol = st.selectbox("Sembol", ["BTCUSDT","ETHUSDT"], index=1)  # ETH varsayılan
-    # Dönem seçimi
+    symbol = st.selectbox("Sembol", ["BTCUSDT","ETHUSDT"], index=1)
+
     st.caption("Backtest dönemi (UTC)")
     start_date = st.date_input("Başlangıç", value=None)
     end_date   = st.date_input("Bitiş", value=None)
 
-    st.subheader("Opsiyonel Filtreler")
+    st.subheader("LRC & Filtreler")
     use_lrc_trg = st.checkbox("LRC tetikleyici (Long: Close>LRC_HIGH, Short: Close<LRC_LOW)", value=True)
     lrc_len = st.number_input("LRC length (5m)", min_value=50, max_value=1000, value=300, step=10)
     use_pullback = st.checkbox("Pullback: |C-EMA13|/ATR ≤ eşik", value=False)
@@ -458,6 +422,7 @@ with st.sidebar:
     rr = st.number_input("Risk/Ödül (TP/SL)", min_value=0.5, max_value=10.0, value=2.0, step=0.1)
     atr_mult = st.number_input("SL = ATR ×", min_value=0.5, max_value=10.0, value=2.0, step=0.1)
     entry_off = st.number_input("Giriş offset (bps)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
+
     swing_override = st.checkbox("Swing-stop override (long: swing low − 1 pip, short: swing high + 1 pip)", value=False)
     swing_lb = st.number_input("Swing lookback (bar)", min_value=2, max_value=50, value=5, step=1, disabled=not swing_override)
     pip_manual = st.text_input("Pip adımı (boş=otomatik)", value="")
@@ -482,40 +447,41 @@ if run_btn:
         local_path = ensure_local_copy(local_name, use_url)
         big = load_parquet(local_path)
     except requests.HTTPError as e:
-        st.error(f"HTTP hatası: {e}")
-        st.stop()
+        st.error(f"HTTP hatası: {e}"); st.stop()
     except requests.RequestException as e:
-        st.error(f"Ağ hatası: {e}")
-        st.stop()
+        st.error(f"Ağ hatası: {e}"); st.stop()
     except Exception as e:
-        st.error(f"Okuma/İndirme hatası: {e}")
-        st.stop()
+        st.error(f"Okuma/İndirme hatası: {e}"); st.stop()
 
     st.success(f"Yüklendi: {len(big):,} satır | Semboller: {sorted(big['symbol'].unique())} | TF: {sorted(big['timeframe'].unique())}")
 
-    # 2) 5m ve 1h ayır, EMA zorunlularını uygula
-    df5, df1h = prepare_timeframes(big, symbol)
-    if df5.empty or df1h.empty:
-        st.error("Seçilen sembol için 5m veya 1h veri bulunamadı.")
-        st.stop()
-    df5 = enforce_ema_conditions(df5, df1h)
+    # 2) 5m/1h ayır (full)
+    df5_full, df1h_full = split_timeframes(big, symbol)
+    if df5_full.empty or df1h_full.empty:
+        st.error("Seçilen sembol için 5m veya 1h veri yok."); st.stop()
 
-    # 3) Dönem filtrele (UTC)
+    # 3) Tüm veri üstünde warm-up + göstergeler
+    df5_full, df1h_full = compute_indicators_full(df5_full, df1h_full, lrc_length=int(lrc_len))
+
+    # 4) Tarih filtresi en sonda (warm-up korundu)
+    df5 = df5_full
     if start_date:
         df5 = df5[df5.index >= pd.Timestamp(start_date).tz_localize("UTC")]
     if end_date:
-        # end_date dahil olsun diye +1 gün
         end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1)
         df5 = df5[df5.index < end_ts.tz_localize("UTC")]
 
-    if len(df5) < 400:
-        st.warning("Uyarı: LRC(300) ve EMA için yeterli warm-up olmayabilir (veri kısa).")
+    # 1h EMA’ları 5m’ye eşle
+    df5 = align_1h_to_5m(df5, df1h_full)
 
-    # 4) Sinyaller
+    # Uyarı (yalnızca gerçekten kısa ise)
+    if len(df5) < max(350, int(lrc_len) + 30):
+        st.warning("Uyarı: Seçilen aralık çok kısa. LRC/EMA warm-up sonrası sinyal az olabilir.")
+
+    # 5) Sinyaller
     sig = make_signals(
         df5,
         use_lrc_trigger=use_lrc_trg,
-        lrc_length=int(lrc_len),
         use_pullback=use_pullback,
         pullback_thr=float(pull_thr),
         use_engulf=use_engulf,
@@ -523,7 +489,7 @@ if run_btn:
         lrc_chop_min=float(lrc_chop_min)
     )
 
-    # 5) Backtest
+    # 6) Backtest
     try:
         pip_val = float(pip_manual) if pip_manual.strip() else None
     except:
@@ -534,7 +500,6 @@ if run_btn:
         rr=rr,
         atr_stop_mult=atr_mult,
         entry_offset_bps=entry_off,
-        one_trade_at_a_time=True,
         fee_rate=fee,
         initial_equity=init_eq,
         risk_mode=risk_mode,
@@ -547,7 +512,51 @@ if run_btn:
         cooldown_bars=int(cooldown)
     )
 
-    # 6) Görselleştirme + Özet
+    # 7) Grafik (işlem işaretleri dahil)
+    st.subheader("Grafik (5m) — EMA & LRC & İşlemler")
+    view = sig.copy()
+    # Candles
+    fig = go.Figure(data=[go.Candlestick(
+        x=view.index, open=view["open"], high=view["high"], low=view["low"], close=view["close"],
+        name="5m"
+    )])
+    # EMA’lar
+    for col, nm in [("ema7","EMA7"), ("ema13","EMA13"), ("ema26","EMA26")]:
+        if col in view:
+            fig.add_trace(go.Scatter(x=view.index, y=view[col], name=nm, mode="lines"))
+    # LRC
+    if "lrc_high" in view and "lrc_low" in view:
+        fig.add_trace(go.Scatter(x=view.index, y=view["lrc_high"], name="LRC High", mode="lines"))
+        fig.add_trace(go.Scatter(x=view.index, y=view["lrc_low"],  name="LRC Low",  mode="lines"))
+    # Entry/Exit marker’ları
+    if len(trades):
+        long_ent = trades[trades["side"]=="long"]
+        short_ent = trades[trades["side"]=="short"]
+        if len(long_ent):
+            fig.add_trace(go.Scatter(
+                x=long_ent["time"], y=long_ent["entry"], mode="markers", name="Long Entry",
+                marker=dict(symbol="triangle-up", size=10)))
+        if len(short_ent):
+            fig.add_trace(go.Scatter(
+                x=short_ent["time"], y=short_ent["entry"], mode="markers", name="Short Entry",
+                marker=dict(symbol="triangle-down", size=10)))
+        # Exit’ler
+        exited = trades.dropna(subset=["exit_time"])
+        if len(exited):
+            tp_rows = exited[exited["result"].str.contains("TP", na=False)]
+            sl_rows = exited[exited["result"].str.contains("SL", na=False)]
+            if len(tp_rows):
+                fig.add_trace(go.Scatter(
+                    x=tp_rows["exit_time"], y=tp_rows["exit"], mode="markers", name="TP",
+                    marker=dict(symbol="circle", size=8)))
+            if len(sl_rows):
+                fig.add_trace(go.Scatter(
+                    x=sl_rows["exit_time"], y=sl_rows["exit"], mode="markers", name="SL",
+                    marker=dict(symbol="x", size=9)))
+    fig.update_layout(xaxis_rangeslider_visible=False, height=520, legend_orientation="h")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 8) Özet + Equity
     c1, c2 = st.columns([2,1])
     with c1:
         st.subheader("Equity Eğrisi")
@@ -569,37 +578,36 @@ if run_btn:
         }
         st.write(pretty)
 
+    # 9) İşlemler tablosu
     st.subheader("İşlemler (son 200)")
     if len(trades):
         st.dataframe(trades.tail(200), use_container_width=True)
     else:
         st.info("İşlem üretilmedi. Parametreleri değiştirip tekrar dene.")
 
-    # 7) CSV Kayıt + İndir
+    # 10) CSV Kayıt + İndir
     ts_tag = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
     trades_name = f"trades_{symbol}_5m_{ts_tag}.csv"
     stats_name  = f"stats_{symbol}_5m_{ts_tag}.csv"
     trades_path = os.path.join(EXPORT_DIR, trades_name)
     stats_path  = os.path.join(EXPORT_DIR, stats_name)
-
     try:
         trades.to_csv(trades_path, index=False)
         pd.DataFrame([stats]).to_csv(stats_path, index=False)
         st.success(f"CSV kaydedildi: {trades_name}, {stats_name} (/tmp içinde)")
+        with open(trades_path, "rb") as f:
+            st.download_button("Trades CSV indir", f, file_name=trades_name, mime="text/csv")
+        with open(stats_path, "rb") as f:
+            st.download_button("Stats CSV indir", f, file_name=stats_name, mime="text/csv")
     except Exception as e:
         st.error(f"CSV yazma hatası: {e}")
 
-    # İndirme butonları (reboot öncesi indir)
-    with open(trades_path, "rb") as f:
-        st.download_button("Trades CSV indir", f, file_name=trades_name, mime="text/csv")
-    with open(stats_path, "rb") as f:
-        st.download_button("Stats CSV indir", f, file_name=stats_name, mime="text/csv")
-
-    # 8) Sinyal & indikatör görünümü
-    with st.expander("Sinyal / İndikatör (son 30 bar)"):
-        cols = ["ema7","ema13","ema26","ATR","bull5","bear5","h1_ema7","h1_ema13","bull1h","bear1h",
+    # 11) Sinyal görünümü
+    with st.expander("Sinyal / Göstergeler (son 30 bar)"):
+        cols = ["open","high","low","close",
+                "ema7","ema13","ema26","ATR",
+                "h1_ema7","h1_ema13","bull5","bear5","bull1h","bear1h",
+                "lrc_high","lrc_low","lrc_mid","lrc_width",
                 "long_signal","short_signal"]
-        if "lrc_high" in sig.columns:
-            cols += ["lrc_high","lrc_low","lrc_mid"]
         view_cols = [c for c in cols if c in sig.columns]
         st.dataframe(sig[view_cols].tail(30), use_container_width=True)
