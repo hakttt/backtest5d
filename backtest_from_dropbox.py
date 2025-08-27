@@ -1,7 +1,21 @@
 # backtest_from_dropbox.py
 # Çalıştırma: streamlit run backtest_from_dropbox.py
-# Gerekenler: streamlit, pandas, numpy, requests, fastparquet, plotly
 
+# --- self-heal: eksik paketleri kur (Cloud bazen requirements'i atlayabiliyor) ---
+import sys, subprocess
+
+def ensure(pkg, spec=None):
+    try:
+        __import__(pkg)
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", spec or pkg])
+        __import__(pkg)
+
+# Bu ikisi bazen 3.13 ortamında düşebiliyor:
+ensure("plotly", "plotly==5.22.0")
+ensure("fastparquet", "fastparquet==2024.5.0")
+
+# --- normal importlar ---
 import os
 import io
 import time
@@ -15,7 +29,8 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="LRC + EMA Backtest (5m+1h)", layout="wide")
+# ---------- SAYFA ----------
+st.set_page_config(page_title="LRC + EMA Backtest (5m giriş + 1h onay)", layout="wide")
 
 # ---------- KULLANICI LİNKLERİ ----------
 DEFAULT_FUTURES_URL = (
@@ -29,18 +44,19 @@ DEFAULT_SPOT_URL = (
     "?rlkey=swsjkpbp22v4vj68ggzony8yw&st=2sww3kao&dl=0"
 )
 
+# ---------- DİZİNLER (kalıcı değil; reboot'ta silinebilir) ----------
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "dropbox_cache")
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "backtest_exports")
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# ---------- Yardımcılar ----------
+# ---------- YARDIMCI FONKSİYONLAR ----------
 def to_direct_link(url: str) -> str:
     if "dropbox.com" in url and "dl=0" in url:
         return url.replace("dl=0", "dl=1")
     return url
 
-def stream_download(url: str, dst_path: str, chunk=1024 * 1024, timeout=120):
+def stream_download(url: str, dst_path: str, chunk=1024 * 1024, timeout=180):
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length") or 0)
@@ -53,7 +69,8 @@ def stream_download(url: str, dst_path: str, chunk=1024 * 1024, timeout=120):
                 f.write(part)
                 downloaded += len(part)
                 if total:
-                    st.caption(f"İndiriliyor… {downloaded/1e6:.1f}/{total/1e6:.1f} MB ({downloaded*100/total:.1f}%)")
+                    st.caption(f"İndiriliyor… {downloaded/1e6:.1f}/{total/1e6:.1f} MB "
+                               f"({downloaded*100/total:.1f}%)")
         st.success(f"İndirme tamam: {downloaded/1e6:.1f} MB, {time.time()-t0:.1f} sn")
 
 def ensure_local_copy(name: str, url: str) -> str:
@@ -61,14 +78,23 @@ def ensure_local_copy(name: str, url: str) -> str:
     if not os.path.exists(local_path):
         st.info("Dropbox’tan indiriliyor…")
         direct = to_direct_link(url)
-        stream_download(direct, local_path)
+        try:
+            stream_download(direct, local_path)
+        except requests.HTTPError as e:
+            st.error(f"HTTP hatası: {e}")
+            raise
+        except requests.RequestException as e:
+            st.error(f"Ağ hatası: {e}")
+            raise
     else:
         st.caption(f"Cache’de bulundu: {local_path}")
     return local_path
 
 @st.cache_data(show_spinner=False)
 def load_parquet(local_path: str) -> pd.DataFrame:
-    df = pd.read_parquet(local_path)  # fastparquet olmalı
+    # fastparquet yüklü (self-heal ile)
+    df = pd.read_parquet(local_path)
+    # Zaman damgası
     if not isinstance(df.index, pd.DatetimeIndex):
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -79,6 +105,7 @@ def load_parquet(local_path: str) -> pd.DataFrame:
         df.index = df.index.tz_localize("UTC")
     else:
         df.index = df.index.tz_convert("UTC")
+    # Kolon kontrolleri
     needed = {"open","high","low","close","volume","symbol","timeframe"}
     miss = [c for c in needed if c not in df.columns]
     if miss:
@@ -89,7 +116,7 @@ def load_parquet(local_path: str) -> pd.DataFrame:
     df["timeframe"] = df["timeframe"].astype(str)
     return df.sort_index()
 
-# ---------- EMA / ATR / Formasyon ----------
+# ---------- EMA / ATR / FORMASYON ----------
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
@@ -108,7 +135,7 @@ def is_engulfing(df: pd.DataFrame, bullish=True) -> pd.Series:
         cond = (pc > po) & (c < o) & (h <= ph) & (l >= pl)
     return cond.fillna(False)
 
-# ---------- Swing ve Pip ----------
+# ---------- SWING & PİP ----------
 def estimate_tick(close: pd.Series) -> float:
     diffs = (close - close.shift(1)).dropna().abs()
     diffs = diffs[diffs > 0]
@@ -129,7 +156,7 @@ def last_swing_low(high: pd.Series, low: pd.Series, lookback: int = 5) -> pd.Ser
 def last_swing_high(high: pd.Series, low: pd.Series, lookback: int = 5) -> pd.Series:
     return high.shift(1).rolling(lookback, min_periods=1).max()
 
-# ---------- LRC (senin kodun) ----------
+# ---------- LRC (senin verdiğin) ----------
 def _lrc_last_point(values: np.ndarray) -> float:
     w = np.asarray(values, dtype=float).ravel()
     n = w.size
@@ -163,29 +190,30 @@ def price_position_vs_lrc(close: pd.Series, lrc_high: pd.Series, lrc_low: pd.Ser
     out['pos_label'] = np.where(cond_above, 'above_high', np.where(cond_below, 'below_low', 'between'))
     return out
 
-# ---------- Sinyal üretimi ----------
+# ---------- VERİ AYIRMA ----------
 def split_timeframes(big: pd.DataFrame, symbol: str):
     df5_full = big[(big["symbol"] == symbol) & (big["timeframe"] == "5m")][["open","high","low","close","volume"]].copy()
     df1h_full = big[(big["symbol"] == symbol) & (big["timeframe"] == "1h")][["open","high","low","close","volume"]].copy()
     return df5_full.sort_index(), df1h_full.sort_index()
 
 def compute_indicators_full(df5_full: pd.DataFrame, df1h_full: pd.DataFrame, lrc_length: int):
-    # 5m EMA/ATR (tüm veri)
+    # 5m EMA/ATR
     df5_full["ema7"]  = ema(df5_full["close"], 7)
     df5_full["ema13"] = ema(df5_full["close"], 13)
     df5_full["ema26"] = ema(df5_full["close"], 26)
     df5_full["ATR"]   = atr(df5_full, 14)
 
-    # 1h EMA (tüm veri)
+    # 1h EMA
     df1h_full["ema7"]  = ema(df1h_full["close"], 7)
     df1h_full["ema13"] = ema(df1h_full["close"], 13)
 
-    # 5m LRC bantları (tüm veri)
+    # 5m LRC bantları
     lrc = compute_lrc_bands(df5_full, length=lrc_length)
     df5_full["lrc_high"] = lrc["lrc_high"]
     df5_full["lrc_low"]  = lrc["lrc_low"]
     pos = price_position_vs_lrc(df5_full["close"], df5_full["lrc_high"], df5_full["lrc_low"])
     df5_full["lrc_mid"]   = pos["band_mid"]
+    # Chop ölçüsü: bant genişliği / ATR
     df5_full["lrc_width"] = (df5_full["lrc_high"] - df5_full["lrc_low"]) / df5_full["ATR"].replace(0, np.nan)
     return df5_full, df1h_full
 
@@ -196,6 +224,7 @@ def align_1h_to_5m(df5: pd.DataFrame, df1h_full: pd.DataFrame) -> pd.DataFrame:
     df5["h1_ema13"] = h1_aligned["ema13"]
     return df5
 
+# ---------- SİNYALLER ----------
 def make_signals(df5: pd.DataFrame,
                  use_lrc_trigger: bool,
                  use_pullback: bool,
@@ -204,12 +233,16 @@ def make_signals(df5: pd.DataFrame,
                  use_lrc_chop: bool,
                  lrc_chop_min: float) -> pd.DataFrame:
     out = df5.copy()
-    # Zorunlu EMA trend koşulları
+
+    # ZORUNLU KOŞULLAR (değiştirilemez):
+    # 5m hizası: EMA7 > EMA13 > EMA26 (long) / EMA7 < EMA13 < EMA26 (short)
     out["bull5"]  = (out["ema7"] > out["ema13"]) & (out["ema13"] > out["ema26"])
     out["bear5"]  = (out["ema7"] < out["ema13"]) & (out["ema13"] < out["ema26"])
+    # 1h onay: EMA7 > EMA13 (long) / EMA7 < EMA13 (short)
     out["bull1h"] = (out["h1_ema7"] > out["h1_ema13"])
     out["bear1h"] = (out["h1_ema7"] < out["h1_ema13"])
 
+    # Opsiyonel filtreler
     pull_ok = pd.Series(True, index=out.index)
     eng_bull = pd.Series(True, index=out.index)
     eng_bear = pd.Series(True, index=out.index)
@@ -237,7 +270,7 @@ def make_signals(df5: pd.DataFrame,
     out["short_signal"] = base_short & pull_ok & chop_ok & eng_bear
     return out
 
-# ---------- Backtest ----------
+# ---------- BACKTEST ----------
 def backtest(
     df: pd.DataFrame,
     rr: float = 2.0,
@@ -323,7 +356,8 @@ def backtest(
 
             exit_price = None; result = None
             if tp_hit and sl_hit:
-                result = "SL_first"; exit_price = sl
+                result = "SL_first"  # muhafazakar: önce SL'e değdi varsay
+                exit_price = sl
             elif tp_hit:
                 result = "TP"; exit_price = tp
             elif sl_hit:
@@ -410,12 +444,12 @@ with st.sidebar:
     end_date   = st.date_input("Bitiş", value=None)
 
     st.subheader("LRC & Filtreler")
-    use_lrc_trg = st.checkbox("LRC tetikleyici (Long: Close>LRC_HIGH, Short: Close<LRC_LOW)", value=True)
+    use_lrc_trg = st.checkbox("LRC tetikleyici (Long: Close > LRC_HIGH, Short: Close < LRC_LOW)", value=True)
     lrc_len = st.number_input("LRC length (5m)", min_value=50, max_value=1000, value=300, step=10)
     use_pullback = st.checkbox("Pullback: |C-EMA13|/ATR ≤ eşik", value=False)
     pull_thr = st.number_input("Pullback eşiği", min_value=0.1, max_value=3.0, value=0.5, step=0.1, disabled=not use_pullback)
     use_engulf = st.checkbox("Engulfing filtresi (5m, yön uyumlu)", value=False)
-    use_lrc_chop = st.checkbox("LRC chop filtresi: (LRC_H−LRC_L)/ATR ≥ eşik", value=False)
+    use_lrc_chop = st.checkbox("LRC chop filtresi: (LRC_H − LRC_L)/ATR ≥ eşik", value=False)
     lrc_chop_min = st.number_input("Chop min", min_value=0.1, max_value=5.0, value=1.0, step=0.1, disabled=not use_lrc_chop)
 
     st.subheader("Risk / Pozisyon")
@@ -446,24 +480,21 @@ if run_btn:
     try:
         local_path = ensure_local_copy(local_name, use_url)
         big = load_parquet(local_path)
-    except requests.HTTPError as e:
-        st.error(f"HTTP hatası: {e}"); st.stop()
-    except requests.RequestException as e:
-        st.error(f"Ağ hatası: {e}"); st.stop()
-    except Exception as e:
-        st.error(f"Okuma/İndirme hatası: {e}"); st.stop()
+    except Exception:
+        st.stop()
 
     st.success(f"Yüklendi: {len(big):,} satır | Semboller: {sorted(big['symbol'].unique())} | TF: {sorted(big['timeframe'].unique())}")
 
     # 2) 5m/1h ayır (full)
     df5_full, df1h_full = split_timeframes(big, symbol)
     if df5_full.empty or df1h_full.empty:
-        st.error("Seçilen sembol için 5m veya 1h veri yok."); st.stop()
+        st.error("Seçilen sembol için 5m veya 1h veri yok.")
+        st.stop()
 
     # 3) Tüm veri üstünde warm-up + göstergeler
     df5_full, df1h_full = compute_indicators_full(df5_full, df1h_full, lrc_length=int(lrc_len))
 
-    # 4) Tarih filtresi en sonda (warm-up korundu)
+    # 4) Tarih filtresi en sonda (warm-up korunsun)
     df5 = df5_full
     if start_date:
         df5 = df5[df5.index >= pd.Timestamp(start_date).tz_localize("UTC")]
@@ -474,9 +505,9 @@ if run_btn:
     # 1h EMA’ları 5m’ye eşle
     df5 = align_1h_to_5m(df5, df1h_full)
 
-    # Uyarı (yalnızca gerçekten kısa ise)
+    # Kısa aralık uyarısı (sadece çok kısa ise)
     if len(df5) < max(350, int(lrc_len) + 30):
-        st.warning("Uyarı: Seçilen aralık çok kısa. LRC/EMA warm-up sonrası sinyal az olabilir.")
+        st.warning("Uyarı: Seçilen aralık kısa olabilir. LRC/EMA warm-up sonrası sinyal az çıkabilir.")
 
     # 5) Sinyaller
     sig = make_signals(
@@ -515,20 +546,19 @@ if run_btn:
     # 7) Grafik (işlem işaretleri dahil)
     st.subheader("Grafik (5m) — EMA & LRC & İşlemler")
     view = sig.copy()
-    # Candles
     fig = go.Figure(data=[go.Candlestick(
         x=view.index, open=view["open"], high=view["high"], low=view["low"], close=view["close"],
         name="5m"
     )])
-    # EMA’lar
+    # EMA'lar
     for col, nm in [("ema7","EMA7"), ("ema13","EMA13"), ("ema26","EMA26")]:
         if col in view:
             fig.add_trace(go.Scatter(x=view.index, y=view[col], name=nm, mode="lines"))
-    # LRC
+    # LRC bantları
     if "lrc_high" in view and "lrc_low" in view:
         fig.add_trace(go.Scatter(x=view.index, y=view["lrc_high"], name="LRC High", mode="lines"))
         fig.add_trace(go.Scatter(x=view.index, y=view["lrc_low"],  name="LRC Low",  mode="lines"))
-    # Entry/Exit marker’ları
+    # Entry/Exit marker'ları
     if len(trades):
         long_ent = trades[trades["side"]=="long"]
         short_ent = trades[trades["side"]=="short"]
@@ -540,7 +570,6 @@ if run_btn:
             fig.add_trace(go.Scatter(
                 x=short_ent["time"], y=short_ent["entry"], mode="markers", name="Short Entry",
                 marker=dict(symbol="triangle-down", size=10)))
-        # Exit’ler
         exited = trades.dropna(subset=["exit_time"])
         if len(exited):
             tp_rows = exited[exited["result"].str.contains("TP", na=False)]
@@ -553,7 +582,7 @@ if run_btn:
                 fig.add_trace(go.Scatter(
                     x=sl_rows["exit_time"], y=sl_rows["exit"], mode="markers", name="SL",
                     marker=dict(symbol="x", size=9)))
-    fig.update_layout(xaxis_rangeslider_visible=False, height=520, legend_orientation="h")
+    fig.update_layout(xaxis_rangeslider_visible=False, height=540, legend_orientation="h")
     st.plotly_chart(fig, use_container_width=True)
 
     # 8) Özet + Equity
@@ -564,50 +593,4 @@ if run_btn:
     with c2:
         st.subheader("Özet")
         pretty = {
-            "Toplam İşlem": stats.get("trades", 0),
-            "Winrate %": round(stats.get("winrate", 0.0), 2),
-            "Net Toplam (USDT)": round(stats.get("net_total", 0.0), 2),
-            "Final Equity": round(stats.get("final_equity", 0.0), 2),
-            "Max Drawdown %": round(stats.get("max_dd", 0.0), 2),
-            "Max Win Streak": stats.get("max_win_streak", 0),
-            "Win Streak Başlangıç": str(stats.get("max_win_streak_start", "")),
-            "Win Streak Bitiş": str(stats.get("max_win_streak_end", "")),
-            "Max Loss Streak": stats.get("max_loss_streak", 0),
-            "Loss Streak Başlangıç": str(stats.get("max_loss_streak_start", "")),
-            "Loss Streak Bitiş": str(stats.get("max_loss_streak_end", "")),
-        }
-        st.write(pretty)
-
-    # 9) İşlemler tablosu
-    st.subheader("İşlemler (son 200)")
-    if len(trades):
-        st.dataframe(trades.tail(200), use_container_width=True)
-    else:
-        st.info("İşlem üretilmedi. Parametreleri değiştirip tekrar dene.")
-
-    # 10) CSV Kayıt + İndir
-    ts_tag = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
-    trades_name = f"trades_{symbol}_5m_{ts_tag}.csv"
-    stats_name  = f"stats_{symbol}_5m_{ts_tag}.csv"
-    trades_path = os.path.join(EXPORT_DIR, trades_name)
-    stats_path  = os.path.join(EXPORT_DIR, stats_name)
-    try:
-        trades.to_csv(trades_path, index=False)
-        pd.DataFrame([stats]).to_csv(stats_path, index=False)
-        st.success(f"CSV kaydedildi: {trades_name}, {stats_name} (/tmp içinde)")
-        with open(trades_path, "rb") as f:
-            st.download_button("Trades CSV indir", f, file_name=trades_name, mime="text/csv")
-        with open(stats_path, "rb") as f:
-            st.download_button("Stats CSV indir", f, file_name=stats_name, mime="text/csv")
-    except Exception as e:
-        st.error(f"CSV yazma hatası: {e}")
-
-    # 11) Sinyal görünümü
-    with st.expander("Sinyal / Göstergeler (son 30 bar)"):
-        cols = ["open","high","low","close",
-                "ema7","ema13","ema26","ATR",
-                "h1_ema7","h1_ema13","bull5","bear5","bull1h","bear1h",
-                "lrc_high","lrc_low","lrc_mid","lrc_width",
-                "long_signal","short_signal"]
-        view_cols = [c for c in cols if c in sig.columns]
-        st.dataframe(sig[view_cols].tail(30), use_container_width=True)
+            "Toplam İşlem": stats.get("trades", 
