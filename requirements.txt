@@ -1,0 +1,5 @@
+streamlit==1.36.0
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3
+fastparquet==2024.5.0
