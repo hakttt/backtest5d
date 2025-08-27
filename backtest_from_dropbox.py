@@ -1,9 +1,8 @@
 # backtest_from_dropbox.py
-# Çalıştırma: streamlit run backtest_from_dropbox.py
+# Çalıştır: streamlit run backtest_from_dropbox.py
 
 # --- self-heal: eksik paketleri kur (Cloud bazen requirements'i atlayabiliyor) ---
 import sys, subprocess
-
 def ensure(pkg, spec=None):
     try:
         __import__(pkg)
@@ -11,7 +10,7 @@ def ensure(pkg, spec=None):
         subprocess.check_call([sys.executable, "-m", "pip", "install", spec or pkg])
         __import__(pkg)
 
-# Bu ikisi bazen 3.13 ortamında düşebiliyor:
+# 3.13 ortamında bazen düşenler:
 ensure("plotly", "plotly==5.22.0")
 ensure("fastparquet", "fastparquet==2024.5.0")
 
@@ -21,7 +20,7 @@ import io
 import time
 import math
 import tempfile
-from typing import Tuple, Optional
+from typing import Optional
 
 import requests
 import numpy as np
@@ -32,7 +31,7 @@ import plotly.graph_objects as go
 # ---------- SAYFA ----------
 st.set_page_config(page_title="LRC + EMA Backtest (5m giriş + 1h onay)", layout="wide")
 
-# ---------- KULLANICI LİNKLERİ ----------
+# ---------- KULLANICI LİNKLERİ (senin verdiklerin) ----------
 DEFAULT_FUTURES_URL = (
     "https://www.dropbox.com/scl/fi/diznny37aq4t88vf62umy/"
     "binance_futures_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet"
@@ -92,9 +91,7 @@ def ensure_local_copy(name: str, url: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_parquet(local_path: str) -> pd.DataFrame:
-    # fastparquet yüklü (self-heal ile)
-    df = pd.read_parquet(local_path)
-    # Zaman damgası
+    df = pd.read_parquet(local_path)  # fastparquet/pyarrow otomatik
     if not isinstance(df.index, pd.DatetimeIndex):
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -105,7 +102,6 @@ def load_parquet(local_path: str) -> pd.DataFrame:
         df.index = df.index.tz_localize("UTC")
     else:
         df.index = df.index.tz_convert("UTC")
-    # Kolon kontrolleri
     needed = {"open","high","low","close","volume","symbol","timeframe"}
     miss = [c for c in needed if c not in df.columns]
     if miss:
@@ -156,7 +152,7 @@ def last_swing_low(high: pd.Series, low: pd.Series, lookback: int = 5) -> pd.Ser
 def last_swing_high(high: pd.Series, low: pd.Series, lookback: int = 5) -> pd.Series:
     return high.shift(1).rolling(lookback, min_periods=1).max()
 
-# ---------- LRC (senin verdiğin) ----------
+# ---------- LRC (senin kodun) ----------
 def _lrc_last_point(values: np.ndarray) -> float:
     w = np.asarray(values, dtype=float).ravel()
     n = w.size
@@ -234,11 +230,10 @@ def make_signals(df5: pd.DataFrame,
                  lrc_chop_min: float) -> pd.DataFrame:
     out = df5.copy()
 
-    # ZORUNLU KOŞULLAR (değiştirilemez):
-    # 5m hizası: EMA7 > EMA13 > EMA26 (long) / EMA7 < EMA13 < EMA26 (short)
+    # ZORUNLU KOŞUL (değiştirilemez):
+    # 5m hizası + 1h onay aynı anda
     out["bull5"]  = (out["ema7"] > out["ema13"]) & (out["ema13"] > out["ema26"])
     out["bear5"]  = (out["ema7"] < out["ema13"]) & (out["ema13"] < out["ema26"])
-    # 1h onay: EMA7 > EMA13 (long) / EMA7 < EMA13 (short)
     out["bull1h"] = (out["h1_ema7"] > out["h1_ema13"])
     out["bear1h"] = (out["h1_ema7"] < out["h1_ema13"])
 
@@ -505,7 +500,7 @@ if run_btn:
     # 1h EMA’ları 5m’ye eşle
     df5 = align_1h_to_5m(df5, df1h_full)
 
-    # Kısa aralık uyarısı (sadece çok kısa ise)
+    # Kısa aralık uyarısı (çok kısa ise)
     if len(df5) < max(350, int(lrc_len) + 30):
         st.warning("Uyarı: Seçilen aralık kısa olabilir. LRC/EMA warm-up sonrası sinyal az çıkabilir.")
 
@@ -593,4 +588,25 @@ if run_btn:
     with c2:
         st.subheader("Özet")
         pretty = {
-            "Toplam İşlem": stats.get("trades", 
+            "Toplam İşlem": stats.get("trades", 0),
+            "Winrate (%)": round(stats.get("winrate", 0.0), 2),
+            "Net PnL": round(stats.get("net_total", 0.0), 2),
+            "Final Equity": round(stats.get("final_equity", init_eq), 2),
+            "Maks DD (%)": round(stats.get("max_dd", 0.0), 2),
+            "Max Win Streak": stats.get("max_win_streak", 0),
+            "Max Loss Streak": stats.get("max_loss_streak", 0),
+        }
+        st.table(pd.DataFrame.from_dict(pretty, orient="index", columns=["Değer"]))
+
+    # 9) İşlem detayları + CSV
+    st.subheader("İşlem Detayları")
+    if len(trades):
+        st.dataframe(trades, use_container_width=True)
+        csv_path = os.path.join(EXPORT_DIR, f"trades_{symbol}_{dataset_choice}.csv")
+        trades.to_csv(csv_path, index=False)
+        with open(csv_path, "rb") as f:
+            st.download_button("CSV indir", data=f.read(),
+                               file_name=f"trades_{symbol}_{dataset_choice}.csv",
+                               mime="text/csv")
+    else:
+        st.info("Hiç işlem bulunamadı.")
