@@ -1,20 +1,6 @@
 # backtest_from_dropbox.py
 # Çalıştır: streamlit run backtest_from_dropbox.py
 
-# --- self-heal: eksik paketleri kur (Cloud bazen requirements'i atlayabiliyor) ---
-import sys, subprocess
-def ensure(pkg, spec=None):
-    try:
-        __import__(pkg)
-    except ModuleNotFoundError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", spec or pkg])
-        __import__(pkg)
-
-# 3.13 ortamında bazen düşenler:
-ensure("plotly", "plotly==5.22.0")
-ensure("fastparquet", "fastparquet==2024.5.0")
-
-# --- normal importlar ---
 import os
 import io
 import time
@@ -22,16 +8,21 @@ import math
 import tempfile
 from typing import Optional
 
-import requests
-import numpy as np
-import pandas as pd
+# --- güvenli importlar: eksikse ekran uyarısı ver ve dur ---
 import streamlit as st
-import plotly.graph_objects as go
+try:
+    import pandas as pd
+    import numpy as np
+    import plotly.graph_objects as go
+    import requests
+except ModuleNotFoundError as e:
+    st.error(f"Gerekli paket eksik: {e}. Lütfen requirements.txt içinde bu paketi ekleyin ve app’i yeniden başlatın.")
+    st.stop()
 
 # ---------- SAYFA ----------
 st.set_page_config(page_title="LRC + EMA Backtest (5m giriş + 1h onay)", layout="wide")
 
-# ---------- KULLANICI LİNKLERİ (senin verdiklerin) ----------
+# ---------- KULLANICI LİNKLERİ ----------
 DEFAULT_FUTURES_URL = (
     "https://www.dropbox.com/scl/fi/diznny37aq4t88vf62umy/"
     "binance_futures_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet"
@@ -43,7 +34,7 @@ DEFAULT_SPOT_URL = (
     "?rlkey=swsjkpbp22v4vj68ggzony8yw&st=2sww3kao&dl=0"
 )
 
-# ---------- DİZİNLER (kalıcı değil; reboot'ta silinebilir) ----------
+# ---------- DİZİNLER (geçici) ----------
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "dropbox_cache")
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "backtest_exports")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -91,7 +82,8 @@ def ensure_local_copy(name: str, url: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_parquet(local_path: str) -> pd.DataFrame:
-    df = pd.read_parquet(local_path)  # fastparquet/pyarrow otomatik
+    # pandas, yüklü olan engine'i kullanır (fastparquet/pyarrow). requirements'ta fastparquet var.
+    df = pd.read_parquet(local_path)
     if not isinstance(df.index, pd.DatetimeIndex):
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -152,7 +144,7 @@ def last_swing_low(high: pd.Series, low: pd.Series, lookback: int = 5) -> pd.Ser
 def last_swing_high(high: pd.Series, low: pd.Series, lookback: int = 5) -> pd.Series:
     return high.shift(1).rolling(lookback, min_periods=1).max()
 
-# ---------- LRC (senin kodun) ----------
+# ---------- LRC ----------
 def _lrc_last_point(values: np.ndarray) -> float:
     w = np.asarray(values, dtype=float).ravel()
     n = w.size
@@ -193,23 +185,19 @@ def split_timeframes(big: pd.DataFrame, symbol: str):
     return df5_full.sort_index(), df1h_full.sort_index()
 
 def compute_indicators_full(df5_full: pd.DataFrame, df1h_full: pd.DataFrame, lrc_length: int):
-    # 5m EMA/ATR
     df5_full["ema7"]  = ema(df5_full["close"], 7)
     df5_full["ema13"] = ema(df5_full["close"], 13)
     df5_full["ema26"] = ema(df5_full["close"], 26)
     df5_full["ATR"]   = atr(df5_full, 14)
 
-    # 1h EMA
     df1h_full["ema7"]  = ema(df1h_full["close"], 7)
     df1h_full["ema13"] = ema(df1h_full["close"], 13)
 
-    # 5m LRC bantları
     lrc = compute_lrc_bands(df5_full, length=lrc_length)
     df5_full["lrc_high"] = lrc["lrc_high"]
     df5_full["lrc_low"]  = lrc["lrc_low"]
     pos = price_position_vs_lrc(df5_full["close"], df5_full["lrc_high"], df5_full["lrc_low"])
     df5_full["lrc_mid"]   = pos["band_mid"]
-    # Chop ölçüsü: bant genişliği / ATR
     df5_full["lrc_width"] = (df5_full["lrc_high"] - df5_full["lrc_low"]) / df5_full["ATR"].replace(0, np.nan)
     return df5_full, df1h_full
 
@@ -229,15 +217,12 @@ def make_signals(df5: pd.DataFrame,
                  use_lrc_chop: bool,
                  lrc_chop_min: float) -> pd.DataFrame:
     out = df5.copy()
-
-    # ZORUNLU KOŞUL (değiştirilemez):
-    # 5m hizası + 1h onay aynı anda
+    # ZORUNLU: 5m hizası + 1h onay
     out["bull5"]  = (out["ema7"] > out["ema13"]) & (out["ema13"] > out["ema26"])
     out["bear5"]  = (out["ema7"] < out["ema13"]) & (out["ema13"] < out["ema26"])
     out["bull1h"] = (out["h1_ema7"] > out["h1_ema13"])
     out["bear1h"] = (out["h1_ema7"] < out["h1_ema13"])
 
-    # Opsiyonel filtreler
     pull_ok = pd.Series(True, index=out.index)
     eng_bull = pd.Series(True, index=out.index)
     eng_bear = pd.Series(True, index=out.index)
@@ -273,7 +258,7 @@ def backtest(
     entry_offset_bps: float = 0.0,
     fee_rate: float = 0.0004,
     initial_equity: float = 1000.0,
-    risk_mode: str = "dynamic",   # "dynamic" | "fixed"
+    risk_mode: str = "dynamic",
     fixed_amount: float = 100.0,
     risk_pct: float = 0.02,
     leverage: float = 10.0,
@@ -351,7 +336,7 @@ def backtest(
 
             exit_price = None; result = None
             if tp_hit and sl_hit:
-                result = "SL_first"  # muhafazakar: önce SL'e değdi varsay
+                result = "SL_first"
                 exit_price = sl
             elif tp_hit:
                 result = "TP"; exit_price = tp
@@ -486,10 +471,10 @@ if run_btn:
         st.error("Seçilen sembol için 5m veya 1h veri yok.")
         st.stop()
 
-    # 3) Tüm veri üstünde warm-up + göstergeler
+    # 3) Göstergeler (full warm-up)
     df5_full, df1h_full = compute_indicators_full(df5_full, df1h_full, lrc_length=int(lrc_len))
 
-    # 4) Tarih filtresi en sonda (warm-up korunsun)
+    # 4) Tarih filtresi
     df5 = df5_full
     if start_date:
         df5 = df5[df5.index >= pd.Timestamp(start_date).tz_localize("UTC")]
@@ -500,7 +485,6 @@ if run_btn:
     # 1h EMA’ları 5m’ye eşle
     df5 = align_1h_to_5m(df5, df1h_full)
 
-    # Kısa aralık uyarısı (çok kısa ise)
     if len(df5) < max(350, int(lrc_len) + 30):
         st.warning("Uyarı: Seçilen aralık kısa olabilir. LRC/EMA warm-up sonrası sinyal az çıkabilir.")
 
@@ -538,22 +522,20 @@ if run_btn:
         cooldown_bars=int(cooldown)
     )
 
-    # 7) Grafik (işlem işaretleri dahil)
+    # 7) Grafik
     st.subheader("Grafik (5m) — EMA & LRC & İşlemler")
     view = sig.copy()
     fig = go.Figure(data=[go.Candlestick(
         x=view.index, open=view["open"], high=view["high"], low=view["low"], close=view["close"],
         name="5m"
     )])
-    # EMA'lar
     for col, nm in [("ema7","EMA7"), ("ema13","EMA13"), ("ema26","EMA26")]:
         if col in view:
             fig.add_trace(go.Scatter(x=view.index, y=view[col], name=nm, mode="lines"))
-    # LRC bantları
     if "lrc_high" in view and "lrc_low" in view:
         fig.add_trace(go.Scatter(x=view.index, y=view["lrc_high"], name="LRC High", mode="lines"))
         fig.add_trace(go.Scatter(x=view.index, y=view["lrc_low"],  name="LRC Low",  mode="lines"))
-    # Entry/Exit marker'ları
+
     if len(trades):
         long_ent = trades[trades["side"]=="long"]
         short_ent = trades[trades["side"]=="short"]
