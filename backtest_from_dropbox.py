@@ -8,8 +8,22 @@ import math
 import tempfile
 from typing import Optional
 
-# --- güvenli importlar: eksikse ekran uyarısı ver ve dur ---
 import streamlit as st
+
+# --- Hızlı teşhis: ortam bilgisini göster ---
+try:
+    import sys, pkgutil, importlib.metadata as imd
+    st.caption(f"Python: {sys.version}")
+    st.caption("plotly modülü görüldü mü? → " + ("Evet" if pkgutil.find_loader("plotly") else "Hayır"))
+    try:
+        _names = {d.metadata["Name"].lower() for d in imd.distributions()}
+        st.caption("Yüklü plotly sürümü: " + (imd.version("plotly") if "plotly" in _names else "yok"))
+    except Exception:
+        pass
+except Exception:
+    pass
+
+# --- zorunlu paketler ---
 try:
     import pandas as pd
     import numpy as np
@@ -19,10 +33,9 @@ except ModuleNotFoundError as e:
     st.error(f"Gerekli paket eksik: {e}. Lütfen requirements.txt içinde bu paketi ekleyin ve app’i yeniden başlatın.")
     st.stop()
 
-# ---------- SAYFA ----------
 st.set_page_config(page_title="LRC + EMA Backtest (5m giriş + 1h onay)", layout="wide")
 
-# ---------- KULLANICI LİNKLERİ ----------
+# ---------- Kullanıcı sağlayacağı linkler ----------
 DEFAULT_FUTURES_URL = (
     "https://www.dropbox.com/scl/fi/diznny37aq4t88vf62umy/"
     "binance_futures_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet"
@@ -34,13 +47,13 @@ DEFAULT_SPOT_URL = (
     "?rlkey=swsjkpbp22v4vj68ggzony8yw&st=2sww3kao&dl=0"
 )
 
-# ---------- DİZİNLER (geçici) ----------
+# ---------- Geçici klasörler ----------
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "dropbox_cache")
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "backtest_exports")
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# ---------- YARDIMCI FONKSİYONLAR ----------
+# ---------- Yardımcılar ----------
 def to_direct_link(url: str) -> str:
     if "dropbox.com" in url and "dl=0" in url:
         return url.replace("dl=0", "dl=1")
@@ -82,8 +95,7 @@ def ensure_local_copy(name: str, url: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_parquet(local_path: str) -> pd.DataFrame:
-    # pandas, yüklü olan engine'i kullanır (fastparquet/pyarrow). requirements'ta fastparquet var.
-    df = pd.read_parquet(local_path)
+    df = pd.read_parquet(local_path)  # engine=fastparquet mevcut
     if not isinstance(df.index, pd.DatetimeIndex):
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -104,7 +116,7 @@ def load_parquet(local_path: str) -> pd.DataFrame:
     df["timeframe"] = df["timeframe"].astype(str)
     return df.sort_index()
 
-# ---------- EMA / ATR / FORMASYON ----------
+# ---------- EMA / ATR / Formasyon ----------
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
@@ -123,7 +135,7 @@ def is_engulfing(df: pd.DataFrame, bullish=True) -> pd.Series:
         cond = (pc > po) & (c < o) & (h <= ph) & (l >= pl)
     return cond.fillna(False)
 
-# ---------- SWING & PİP ----------
+# ---------- Swing & Pip ----------
 def estimate_tick(close: pd.Series) -> float:
     diffs = (close - close.shift(1)).dropna().abs()
     diffs = diffs[diffs > 0]
@@ -178,7 +190,7 @@ def price_position_vs_lrc(close: pd.Series, lrc_high: pd.Series, lrc_low: pd.Ser
     out['pos_label'] = np.where(cond_above, 'above_high', np.where(cond_below, 'below_low', 'between'))
     return out
 
-# ---------- VERİ AYIRMA ----------
+# ---------- Veri ayırma & gösterge hazırlama ----------
 def split_timeframes(big: pd.DataFrame, symbol: str):
     df5_full = big[(big["symbol"] == symbol) & (big["timeframe"] == "5m")][["open","high","low","close","volume"]].copy()
     df1h_full = big[(big["symbol"] == symbol) & (big["timeframe"] == "1h")][["open","high","low","close","volume"]].copy()
@@ -208,7 +220,7 @@ def align_1h_to_5m(df5: pd.DataFrame, df1h_full: pd.DataFrame) -> pd.DataFrame:
     df5["h1_ema13"] = h1_aligned["ema13"]
     return df5
 
-# ---------- SİNYALLER ----------
+# ---------- Sinyaller ----------
 def make_signals(df5: pd.DataFrame,
                  use_lrc_trigger: bool,
                  use_pullback: bool,
@@ -217,7 +229,7 @@ def make_signals(df5: pd.DataFrame,
                  use_lrc_chop: bool,
                  lrc_chop_min: float) -> pd.DataFrame:
     out = df5.copy()
-    # ZORUNLU: 5m hizası + 1h onay
+    # ZORUNLU: 5m hizası + 1h onay aynı anda
     out["bull5"]  = (out["ema7"] > out["ema13"]) & (out["ema13"] > out["ema26"])
     out["bear5"]  = (out["ema7"] < out["ema13"]) & (out["ema13"] < out["ema26"])
     out["bull1h"] = (out["h1_ema7"] > out["h1_ema13"])
@@ -250,7 +262,7 @@ def make_signals(df5: pd.DataFrame,
     out["short_signal"] = base_short & pull_ok & chop_ok & eng_bear
     return out
 
-# ---------- BACKTEST ----------
+# ---------- Backtest ----------
 def backtest(
     df: pd.DataFrame,
     rr: float = 2.0,
@@ -465,13 +477,13 @@ if run_btn:
 
     st.success(f"Yüklendi: {len(big):,} satır | Semboller: {sorted(big['symbol'].unique())} | TF: {sorted(big['timeframe'].unique())}")
 
-    # 2) 5m/1h ayır (full)
+    # 2) 5m/1h ayır (full warm-up)
     df5_full, df1h_full = split_timeframes(big, symbol)
     if df5_full.empty or df1h_full.empty:
         st.error("Seçilen sembol için 5m veya 1h veri yok.")
         st.stop()
 
-    # 3) Göstergeler (full warm-up)
+    # 3) Göstergeler (full)
     df5_full, df1h_full = compute_indicators_full(df5_full, df1h_full, lrc_length=int(lrc_len))
 
     # 4) Tarih filtresi
@@ -573,7 +585,7 @@ if run_btn:
             "Toplam İşlem": stats.get("trades", 0),
             "Winrate (%)": round(stats.get("winrate", 0.0), 2),
             "Net PnL": round(stats.get("net_total", 0.0), 2),
-            "Final Equity": round(stats.get("final_equity", init_eq), 2),
+            "Final Equity": round(stats.get("final_equity", 0.0), 2),
             "Maks DD (%)": round(stats.get("max_dd", 0.0), 2),
             "Max Win Streak": stats.get("max_win_streak", 0),
             "Max Loss Streak": stats.get("max_loss_streak", 0),
