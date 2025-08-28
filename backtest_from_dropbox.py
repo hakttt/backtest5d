@@ -73,19 +73,17 @@ def load_parquet(local_path: str) -> pd.DataFrame:
         df.index = df.index.tz_localize("UTC")
     else:
         df.index = df.index.tz_convert("UTC")
-    # Zorunlu kolon kontrolü
     needed = {"open","high","low","close","volume","symbol","timeframe"}
     miss = [c for c in needed if c not in df.columns]
     if miss:
         raise ValueError(f"Beklenen kolon(lar) eksik: {miss}")
-    # Tipler
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["symbol"] = df["symbol"].astype(str)
     df["timeframe"] = df["timeframe"].astype(str)
     return df.sort_index()
 
-# ---------- LRC Fonksiyonları ----------
+# ---------- LRC ----------
 def _lrc_last_point(values: np.ndarray) -> float:
     w = np.asarray(values, dtype=float).ravel()
     n = w.size
@@ -111,8 +109,8 @@ def compute_lrc_bands(df: pd.DataFrame, length: int = 300) -> pd.DataFrame:
 def cached_lrc_bands(df_1d: pd.DataFrame, length: int = 300) -> pd.DataFrame:
     if df_1d is None or df_1d.empty:
         return pd.DataFrame(index=getattr(df_1d, "index", None))
-    # index tekilleştir + sırala (güvenlik)
-    df_1d = df_1d[~df_1d.index.duplicated(keep="last")].sort_index()
+    df_1d = df_1d.sort_index()
+    df_1d = df_1d[~df_1d.index.duplicated(keep="last")]
     key = (str(df_1d.index.min()) + str(df_1d.index.max()) +
            str(float(df_1d["close"].sum())))
     _ = hashlib.md5(key.encode()).hexdigest()
@@ -133,17 +131,13 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
                                     atr_len=14, regime_filter=None,
                                     use_lrc=False, allow_long=True, allow_short=True):
     """
-    Sabit EMA çekirdeği:
-      - 5m: EMA(7)>EMA(13)>EMA(26) => long ; EMA(7)<EMA(13)<EMA(26) => short
-      - 1h: yön teyidi (EMA7 vs EMA13)
-    Opsiyonel LRC filtresi (1D LRC-300):
-      - close > lrc_high -> sadece long
-      - close < lrc_low  -> sadece short
-      - aradaysa -> iki yön de engellenir
+    5m: EMA(7)>EMA(13)>EMA(26) => long ; EMA(7)<EMA(13)<EMA(26) => short
+    1h: yön teyidi (EMA7 vs EMA13) — 5m zamanına forward-fill
+    LRC (1D, opsiyonel): close>lrc_high -> sadece long; close<lrc_low -> sadece short
     """
     ema_fast, ema_mid, ema_slow = 7, 13, 26
 
-    # --- indeksleri tekilleştir + sırala (buradaki düzeltme hatayı giderir) ---
+    # indeksleri temizle
     out = df_5m.copy().sort_index()
     out = out[~out.index.duplicated(keep="last")]
 
@@ -154,7 +148,7 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
     if d1 is not None and not d1.empty:
         d1 = d1[~d1.index.duplicated(keep="last")]
 
-    # --- EMA'lar ---
+    # EMA'lar
     out["ema_f"] = ema(out["close"], ema_fast)
     out["ema_m"] = ema(out["close"], ema_mid)
     out["ema_s"] = ema(out["close"], ema_slow)
@@ -167,10 +161,9 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
     bull_5m = (out["ema_f"] > out["ema_m"]) & (out["ema_m"] > out["ema_s"])
     bear_5m = (out["ema_f"] < out["ema_m"]) & (out["ema_m"] < out["ema_s"])
 
-    # 1h hizayı 5m'e taşımak
-    key_5m = out.index.floor("H")
-    bull_1h_on_5m = h["bull_align_h"].reindex(key_5m).ffill().reindex(out.index)
-    bear_1h_on_5m = h["bear_align_h"].reindex(key_5m).ffill().reindex(out.index)
+    # --- DÜZELTME: 1h -> 5m tek adım reindex (ffill), çift reindex kaldırıldı ---
+    bull_1h_on_5m = h["bull_align_h"].reindex(out.index, method="ffill")
+    bear_1h_on_5m = h["bear_align_h"].reindex(out.index, method="ffill")
 
     long_raw  = bull_5m & bull_1h_on_5m
     short_raw = bear_5m & bear_1h_on_5m
@@ -194,7 +187,7 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
     out["short_signal"] = short_raw.fillna(False)
     return out
 
-# ---------- Swing level yardımcıları ----------
+# ---------- Swing yardımcıları ----------
 def _last_swing_low(high: pd.Series, low: pd.Series, lookback: int = 10) -> float:
     end = len(low) - 1
     start = max(2, end - lookback)
@@ -213,7 +206,7 @@ def _last_swing_high(high: pd.Series, low: pd.Series, lookback: int = 10) -> flo
                 return float(high.iloc[i])
     return float(high.iloc[start:end].max()) if end > start else float(high.iloc[end])
 
-# ---------- Yardımcı metrik: consecutive win/loss ----------
+# ---------- Streak yardımcı ----------
 def _consecutive_streaks(win_flags: pd.Series) -> Tuple[int, int]:
     max_w = max_l = cur_w = cur_l = 0
     for v in win_flags.astype(bool).tolist():
@@ -227,14 +220,14 @@ def _consecutive_streaks(win_flags: pd.Series) -> Tuple[int, int]:
 
 # ---------- Backtest ----------
 def backtest(df: pd.DataFrame,
-             stop_type: str = "Swing",     # "Swing" | "ATR"
-             tp_percent: float = 10.0,     # Swing modunda kullanılır
-             rr: float = 2.0,              # ATR modunda kullanılır
-             atr_stop_mult: float = 2.0,   # ATR modunda kullanılır
+             stop_type: str = "Swing",
+             tp_percent: float = 10.0,
+             rr: float = 2.0,
+             atr_stop_mult: float = 2.0,
              entry_offset_bps: float = 0.0,
-             fee_rate: float = 0.0004,     # her bacak için
+             fee_rate: float = 0.0004,
              initial_equity: float = 1000.0,
-             risk_mode: str = "dynamic",   # "fixed" or "dynamic"
+             risk_mode: str = "dynamic",
              fixed_amount: float = 100.0,
              risk_pct: float = 0.02,
              leverage: float = 10.0,
@@ -242,7 +235,6 @@ def backtest(df: pd.DataFrame,
              pip_size: float = 0.01) -> Tuple[pd.DataFrame, dict, pd.DataFrame]:
     o, h, l, c = df["open"], df["high"], df["low"], df["close"]
     atrv = df.get("ATR", pd.Series(index=df.index, dtype=float)).fillna(method="ffill")
-
     long_sig  = df["long_signal"].fillna(False)
     short_sig = df["short_signal"].fillna(False)
 
@@ -425,7 +417,6 @@ if run_btn:
         st.error(f"Veri yükleme hatası: {e}")
         st.stop()
 
-    # --- Sembol/timeframe kırp ---
     df_5m_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "5m")].copy()
     df_1h_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "1h")].copy()
     has_1d = any(tf.lower() == "1d" for tf in big["timeframe"].unique())
@@ -435,10 +426,9 @@ if run_btn:
         st.error("5m veya 1h veri yok.")
         st.stop()
 
-    # --- Tarih aralığı uygula (range) ---
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         start_date = pd.Timestamp(date_range[0], tz="UTC")
-        end_date = pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)  # bitiş dahil
+        end_date = pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)
     else:
         start_date = pd.Timestamp(date_range, tz="UTC")
         end_date = start_date + pd.Timedelta(days=1)
@@ -447,13 +437,11 @@ if run_btn:
     df_1h = df_1h_all.loc[(df_1h_all.index >= start_date) & (df_1h_all.index < end_date)].copy().sort_index()
     df_1d = df_1d_all.loc[(df_1d_all.index >= start_date) & (df_1d_all.index < end_date)].copy().sort_index() if has_1d else pd.DataFrame()
 
-    # --- indeksleri tekilleştir (güvenlik) ---
     df_5m = df_5m[~df_5m.index.duplicated(keep="last")]
     df_1h = df_1h[~df_1h.index.duplicated(keep="last")]
     if not df_1d.empty:
         df_1d = df_1d[~df_1d.index.duplicated(keep="last")]
 
-    # --- Bar yeterliliği kontrolleri ---
     if len(df_5m) < 40:
         st.warning("Seçilen aralıkta 5m bar sayısı yetersiz (>= 40 önerilir).")
     if len(df_1h) < 20:
@@ -464,7 +452,6 @@ if run_btn:
         elif len(df_1d) < 300:
             st.warning("LRC(300) için 1D bar sayısı yetersiz (>= 300 gerekir).")
 
-    # --- Sinyaller ---
     regime_arg = None if regime == "Hepsi" else regime
     sig = make_signals_5m_with_1h_and_lrc(
         df_5m, df_1h, df_1d,
@@ -475,7 +462,6 @@ if run_btn:
         allow_short=allow_short
     )
 
-    # --- Backtest ---
     trades, stats, eq = backtest(
         sig,
         stop_type=stop_type,
@@ -493,7 +479,6 @@ if run_btn:
         pip_size=0.01
     )
 
-    # ---- Sonuçlar ----
     c1, c2 = st.columns([2,1])
     with c1:
         st.subheader("Equity Eğrisi (Streamlit)")
@@ -512,7 +497,6 @@ if run_btn:
             "Max Drawdown %": round(stats.get("max_dd", 0.0), 2),
         })
 
-    # ---- Plotly: Equity (ek) + CSV indir ----
     st.subheader("Equity Eğrisi (Plotly)")
     if not eq.empty:
         fig_eq = go.Figure()
@@ -529,7 +513,6 @@ if run_btn:
             mime="text/csv"
         )
 
-    # ---- Plotly: fiyat grafiği + giriş/çıkış + opsiyonel EMA/LRC + TP/SL ----
     st.subheader("Fiyat Grafiği (5m) – Giriş/Çıkış Noktaları")
     if not df_5m.empty:
         fig = go.Figure(data=[go.Candlestick(
@@ -574,7 +557,6 @@ if run_btn:
                             marker=dict(symbol="x", size=9, color="red")
                         ))
 
-            # TP/SL seviyeleri (opsiyonel)
             if draw_tp_sl:
                 for _, tr in trades_to_plot.iterrows():
                     x0 = tr["time"]
@@ -596,13 +578,11 @@ if run_btn:
                             showlegend=False
                         ))
 
-        # EMA overlay (opsiyonel)
         if show_ema and {"ema_f","ema_m","ema_s"}.issubset(sig.columns):
             fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_f"], mode="lines", name="EMA 7"))
             fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_m"], mode="lines", name="EMA 13"))
             fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_s"], mode="lines", name="EMA 26"))
 
-        # LRC overlay (opsiyonel, 1D -> 5m reindex)
         if show_lrc_overlay and not df_1d.empty:
             bands = cached_lrc_bands(df_1d, length=300)
             if not bands.empty:
@@ -616,7 +596,6 @@ if run_btn:
     else:
         st.info("Grafik için 5m veri yok.")
 
-    # ---- İşlem geçmişi + CSV indir ----
     st.subheader("İşlemler")
     if not trades.empty:
         st.dataframe(trades.tail(200), use_container_width=True)
