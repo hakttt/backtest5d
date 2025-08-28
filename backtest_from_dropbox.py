@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 import tempfile
 from typing import Tuple
-from datetime import date  # <-- RANGE default'u için eklendi
+from datetime import date
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="BTC/ETH Backtest (Dropbox Parquet)", layout="wide")
@@ -111,6 +111,8 @@ def compute_lrc_bands(df: pd.DataFrame, length: int = 300) -> pd.DataFrame:
 def cached_lrc_bands(df_1d: pd.DataFrame, length: int = 300) -> pd.DataFrame:
     if df_1d is None or df_1d.empty:
         return pd.DataFrame(index=getattr(df_1d, "index", None))
+    # index tekilleştir + sırala (güvenlik)
+    df_1d = df_1d[~df_1d.index.duplicated(keep="last")].sort_index()
     key = (str(df_1d.index.min()) + str(df_1d.index.max()) +
            str(float(df_1d["close"].sum())))
     _ = hashlib.md5(key.encode()).hexdigest()
@@ -130,14 +132,33 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
 def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
                                     atr_len=14, regime_filter=None,
                                     use_lrc=False, allow_long=True, allow_short=True):
+    """
+    Sabit EMA çekirdeği:
+      - 5m: EMA(7)>EMA(13)>EMA(26) => long ; EMA(7)<EMA(13)<EMA(26) => short
+      - 1h: yön teyidi (EMA7 vs EMA13)
+    Opsiyonel LRC filtresi (1D LRC-300):
+      - close > lrc_high -> sadece long
+      - close < lrc_low  -> sadece short
+      - aradaysa -> iki yön de engellenir
+    """
     ema_fast, ema_mid, ema_slow = 7, 13, 26
 
-    out = df_5m.copy()
+    # --- indeksleri tekilleştir + sırala (buradaki düzeltme hatayı giderir) ---
+    out = df_5m.copy().sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+
+    h = df_1h.copy().sort_index()
+    h = h[~h.index.duplicated(keep="last")]
+
+    d1 = df_1d.copy().sort_index() if df_1d is not None and not df_1d.empty else df_1d
+    if d1 is not None and not d1.empty:
+        d1 = d1[~d1.index.duplicated(keep="last")]
+
+    # --- EMA'lar ---
     out["ema_f"] = ema(out["close"], ema_fast)
     out["ema_m"] = ema(out["close"], ema_mid)
     out["ema_s"] = ema(out["close"], ema_slow)
 
-    h = df_1h.copy()
     h["ema_f_h"] = ema(h["close"], ema_fast)
     h["ema_m_h"] = ema(h["close"], ema_mid)
     h["bull_align_h"] = h["ema_f_h"] > h["ema_m_h"]
@@ -146,6 +167,7 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
     bull_5m = (out["ema_f"] > out["ema_m"]) & (out["ema_m"] > out["ema_s"])
     bear_5m = (out["ema_f"] < out["ema_m"]) & (out["ema_m"] < out["ema_s"])
 
+    # 1h hizayı 5m'e taşımak
     key_5m = out.index.floor("H")
     bull_1h_on_5m = h["bull_align_h"].reindex(key_5m).ffill().reindex(out.index)
     bear_1h_on_5m = h["bear_align_h"].reindex(key_5m).ffill().reindex(out.index)
@@ -153,8 +175,8 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
     long_raw  = bull_5m & bull_1h_on_5m
     short_raw = bear_5m & bear_1h_on_5m
 
-    if use_lrc and not df_1d.empty:
-        bands = cached_lrc_bands(df_1d, length=300)
+    if use_lrc and d1 is not None and not d1.empty:
+        bands = cached_lrc_bands(d1, length=300)
         lrc_high = bands['lrc_high'].reindex(out.index, method='ffill')
         lrc_low  = bands['lrc_low'].reindex(out.index, method='ffill')
         above = out["close"] > lrc_high
@@ -167,7 +189,7 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
     elif regime_filter == "short-only":
         long_raw = pd.Series(False, index=out.index)
 
-    out["ATR"] = atr(out,  atr_len)
+    out["ATR"] = atr(out, atr_len)
     out["long_signal"]  = long_raw.fillna(False)
     out["short_signal"] = short_raw.fillna(False)
     return out
@@ -357,11 +379,10 @@ with st.sidebar:
     regime = st.selectbox("Rejim filtresi", ["Hepsi","long-only","short-only"], index=0)
 
     st.subheader("Tarih Aralığı")
-    # ---> DÜZELTME: İki uçlu (başlangıç, bitiş) range default'u geri getirildi
     default_range = (date(2020, 1, 1), date.today())
     date_range = st.date_input(
         "İşlem aralığı (UTC)",
-        value=default_range,  # iki tarih -> range picker
+        value=default_range,
         help="Başlangıç ve bitiş tarihi seçiniz"
     )
 
@@ -414,18 +435,23 @@ if run_btn:
         st.error("5m veya 1h veri yok.")
         st.stop()
 
-    # --- Tarih aralığı uygula (range beklenir) ---
+    # --- Tarih aralığı uygula (range) ---
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         start_date = pd.Timestamp(date_range[0], tz="UTC")
-        end_date = pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)  # bitiş gününü dahil et
+        end_date = pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)  # bitiş dahil
     else:
-        # herhangi bir sebeple tek tarih gelirse fallback
         start_date = pd.Timestamp(date_range, tz="UTC")
         end_date = start_date + pd.Timedelta(days=1)
 
-    df_5m = df_5m_all.loc[(df_5m_all.index >= start_date) & (df_5m_all.index < end_date)].copy()
-    df_1h = df_1h_all.loc[(df_1h_all.index >= start_date) & (df_1h_all.index < end_date)].copy()
-    df_1d = df_1d_all.loc[(df_1d_all.index >= start_date) & (df_1d_all.index < end_date)].copy() if has_1d else pd.DataFrame()
+    df_5m = df_5m_all.loc[(df_5m_all.index >= start_date) & (df_5m_all.index < end_date)].copy().sort_index()
+    df_1h = df_1h_all.loc[(df_1h_all.index >= start_date) & (df_1h_all.index < end_date)].copy().sort_index()
+    df_1d = df_1d_all.loc[(df_1d_all.index >= start_date) & (df_1d_all.index < end_date)].copy().sort_index() if has_1d else pd.DataFrame()
+
+    # --- indeksleri tekilleştir (güvenlik) ---
+    df_5m = df_5m[~df_5m.index.duplicated(keep="last")]
+    df_1h = df_1h[~df_1h.index.duplicated(keep="last")]
+    if not df_1d.empty:
+        df_1d = df_1d[~df_1d.index.duplicated(keep="last")]
 
     # --- Bar yeterliliği kontrolleri ---
     if len(df_5m) < 40:
@@ -511,7 +537,6 @@ if run_btn:
             low=df_5m["low"], close=df_5m["close"], name="Price (5m)"
         )])
 
-        # görsel yoğunluk için son N trade
         trades_to_plot = trades.tail(int(plot_n_trades)) if not trades.empty else trades
 
         if not trades_to_plot.empty:
