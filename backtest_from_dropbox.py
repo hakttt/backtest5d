@@ -1,622 +1,747 @@
-# ===============================
 # backtest_from_dropbox.py
-# ===============================
+import os
+import io
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Dict
 
+import numpy as np
+import pandas as pd
+import requests
 import streamlit as st
-st.set_page_config(
-    page_title="LRC(1D,300) + EMA Backtest (5m giriş + 1h onay)",
-    layout="wide"
+import plotly.graph_objects as go
+
+# -----------------------------------------------------------
+# Streamlit page config (ilk komut)
+# -----------------------------------------------------------
+st.set_page_config(page_title="EMA + LRC Backtest (5m giriş + 1h onay)", layout="wide")
+
+# -----------------------------------------------------------
+# Varsayılan Dropbox linkleri (seninkiler)
+# -----------------------------------------------------------
+DEFAULT_FUTURES_URL = (
+    "https://www.dropbox.com/scl/fi/diznny37aq4t88vf62umy/"
+    "binance_futures_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet"
+    "?rlkey=4umoh63qiz3fh0v7xuu86oo5n&st=5wu5h1x1&dl=0"
+)
+DEFAULT_SPOT_URL = (
+    "https://www.dropbox.com/scl/fi/eavvv8z452i0b6x1c2a5r/"
+    "binance_spot_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet"
+    "?rlkey=swsjkpbp22v4vj68ggzony8yw&st=2sww3kao&dl=0"
 )
 
-import pandas as pd
-import numpy as np
-import requests
-import io
-import os
-import datetime as dt
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# Plotly sessiz import
-try:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-except ModuleNotFoundError:
-    st.error("Gerekli paket eksik: plotly. Lütfen requirements.txt içinde `plotly==5.22.0` olduğundan emin olun ve uygulamayı yeniden başlatın.")
-    st.stop()
-
-
-# =========================================================
-# ---- Yardımcılar
-# =========================================================
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
-
-def _lrc_last_point(values: np.ndarray) -> float:
-    w = np.asarray(values, dtype=float).ravel()
-    n = w.size
-    if n < 2 or not np.isfinite(w).all():
-        return np.nan
-    x = np.arange(n, dtype=float)
-    m, b = np.polyfit(x, w, 1)
-    return m * (n - 1) + b
-
-def rolling_lrc(series: pd.Series, length: int = 300) -> pd.Series:
-    if series is None or len(series) < length:
-        return pd.Series(index=getattr(series, "index", None), dtype=float)
-    s = pd.to_numeric(series, errors="coerce")
-    return s.rolling(window=length, min_periods=length).apply(_lrc_last_point, raw=True)
-
-def compute_lrc_bands(df_ohlc: pd.DataFrame, length: int = 300) -> pd.DataFrame:
-    out = pd.DataFrame(index=df_ohlc.index)
-    out["lrc_high"] = rolling_lrc(df_ohlc["high"], length=length)
-    out["lrc_low"]  = rolling_lrc(df_ohlc["low"],  length=length)
-    return out
+# -----------------------------------------------------------
+# Yardımcı: güvenli parquet indirme (dl=1 fallback + HTML algı)
+# -----------------------------------------------------------
+def _force_dl1(url: str) -> str:
+    if "dl=" in url:
+        return url.replace("dl=0", "dl=1").replace("dl=2", "dl=1")
+    sep = "&" if "?" in url else "?"
+    return url + f"{sep}dl=1"
 
 @st.cache_data(show_spinner=True)
 def load_parquet_from_dropbox(url: str) -> pd.DataFrame:
-    """Dropbox paylaşımlı linkten parquet yükler."""
-    try:
-        link = url.strip()
-        if link.endswith("?dl=0"):
-            link = link.replace("?dl=0", "?dl=1")
-        elif "dl=" not in link:
-            sep = "&" if "?" in link else "?"
-            link = f"{link}{sep}dl=1"
-        r = requests.get(link, timeout=60)
-        r.raise_for_status()
-        df = pd.read_parquet(io.BytesIO(r.content))
-        # Index zaman olsun
-        if not isinstance(df.index, pd.DatetimeIndex):
-            # olası kolon adları
-            for cand in ["timestamp","time","date","datetime","open_time"]:
-                if cand in df.columns:
-                    df[cand] = pd.to_datetime(df[cand], utc=True, errors="coerce")
-                    df = df.set_index(cand)
-                    break
-        # UTC enforce
-        if isinstance(df.index, pd.DatetimeIndex):
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC")
+    """
+    - Verilen URL ile dener; HTML/preview gelirse dl=1 fallback yapar.
+    - Önce fastparquet ile okur; olmazsa pyarrow denenir (yüklüyse).
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    tried = []
+    for step in [url, _force_dl1(url)]:
+        try:
+            tried.append(step)
+            r = requests.get(step, timeout=120, allow_redirects=True, headers=headers)
+            r.raise_for_status()
+            raw = r.content
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            size_mb = len(raw) / 1_000_000
+            st.caption(f"İndirildi → Content-Type: {ctype} | Boyut: {size_mb:.2f} MB"
+                       + (" (dl=1)" if step != url else ""))
+
+            # HTML/preview kontrolü
+            if b"<!DOCTYPE html" in raw[:400] or "text/html" in ctype:
+                continue  # diğer adım dl=1 ile dene
+
+            # Parquet oku (fastparquet)
+            bio = io.BytesIO(raw)
+            try:
+                df = pd.read_parquet(bio, engine="fastparquet")
+                return _standardize_columns(df)
+            except Exception:
+                bio.seek(0)
+                try:
+                    # pyarrow varsa çalışır; yoksa bu da hata verir
+                    df = pd.read_parquet(bio, engine="pyarrow")
+                    return _standardize_columns(df)
+                except Exception as e2:
+                    raise e2
+        except Exception:
+            continue
+
+    st.error("Parquet okunamadı. Denenen URL'ler:\n" + "\n".join(tried))
+    return pd.DataFrame()
+
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = {c.lower(): c for c in df.columns}
+    # timestamp / time
+    if "time" in cols:
+        tcol = cols["time"]
+    elif "timestamp" in cols:
+        tcol = cols["timestamp"]
+    else:
+        raise ValueError("Zaman kolonu bulunamadı (time/timestamp)")
+    df = df.rename(columns={tcol: "time"})
+    # normalize
+    needed = ["open", "high", "low", "close", "volume"]
+    for n in needed:
+        if n not in df.columns:
+            # bazen büyük harf vs olabilir
+            maybe = [c for c in df.columns if c.lower() == n]
+            if maybe:
+                df = df.rename(columns={maybe[0]: n})
             else:
-                df.index = df.index.tz_convert("UTC")
-        # normalize bazı kolonlar
-        if "timeframe" in df.columns:
-            df["timeframe"] = df["timeframe"].astype(str).str.lower().str.strip()
-        if "symbol" in df.columns:
-            df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
-        return df.sort_index()
-    except Exception as e:
-        st.error(f"Veri okunamadı: {e}")
-        return pd.DataFrame()
-
-def pick_symbol_timeframes(df: pd.DataFrame):
-    # sembol seçimi
-    if "symbol" in df.columns:
-        symbols = sorted(df["symbol"].dropna().unique().tolist())
+                raise ValueError(f"{n} kolonu yok")
+    # interval varsa alt frekansları direkt seçeriz
+    if "interval" in [c.lower() for c in df.columns]:
+        # Do not rename original; add normalized 'interval_norm'
+        iv = None
+        for c in df.columns:
+            if c.lower() == "interval":
+                iv = c
+                break
+        df["interval_norm"] = df[iv].astype(str).str.lower()
     else:
-        symbols = ["(tek sembol)"]
-        df["symbol"] = "(tek sembol)"
-    sym = st.selectbox("Sembol", symbols, index=0)
+        df["interval_norm"] = ""
+    # symbol normalize
+    if "symbol" not in df.columns:
+        maybe = [c for c in df.columns if c.lower() == "symbol"]
+        if maybe:
+            df = df.rename(columns={maybe[0]: "symbol"})
+        else:
+            # tek sembollü set olabilir
+            df["symbol"] = "UNKNOWN"
+    # dt
+    df["time"] = pd.to_datetime(df["time"], utc=False)
+    return df.sort_values("time").reset_index(drop=True)
 
-    # timeframe seçimi
-    if "timeframe" in df.columns:
-        tfs = sorted(df["timeframe"].dropna().unique().tolist())
-        with st.expander("Bulunan timeframeler", expanded=False):
-            st.write(tfs)
-        tf_5m = "5m" if "5m" in tfs else st.selectbox("5m için TF seçin", tfs, index=0, key="tf5m")
-        tf_1h = "1h" if "1h" in tfs else st.selectbox("1h için TF seçin", tfs, index=min(1, len(tfs)-1), key="tf1h")
-        df5_all  = df[df["timeframe"] == tf_5m]
-        df1h_all = df[df["timeframe"] == tf_1h]
-    else:
-        st.warning("timeframe kolonu yok. 5m varsayımı yapılıyor; 1h verisi 5m’den resample edilecek.")
-        df5_all = df.copy()
-        df1h_all = df5_all.resample("1h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+# -----------------------------------------------------------
+# Göstergeler
+# -----------------------------------------------------------
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
-    # sembole göre kes
-    df5  = df5_all[df5_all["symbol"] == sym] if "symbol" in df5_all.columns else df5_all
-    df1h = df1h_all[df1h_all["symbol"] == sym] if "symbol" in df1h_all.columns else df1h_all
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # TR = max(H-L, |H-Cprev|, |L-Cprev|)
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        (df["high"] - df["low"]).abs(),
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(window=period, min_periods=period).mean()
 
-    # OHLCV zorunlu kontrol
-    for need in ["open","high","low","close","volume"]:
-        if need not in df5.columns:
-            st.error(f"5m verisi '{need}' kolonu içermiyor.")
-            st.stop()
-        if need not in df1h.columns:
-            st.error(f"1h verisi '{need}' kolonu içermiyor (resample gerekebilir).")
-            st.stop()
+def tsi(close: pd.Series, r: int = 25, s: int = 13) -> pd.Series:
+    m = close.diff()
+    ema1 = m.ewm(span=r, adjust=False).mean()
+    ema2 = ema1.ewm(span=s, adjust=False).mean()
+    abs1 = m.abs().ewm(span=r, adjust=False).mean()
+    abs2 = abs1.ewm(span=s, adjust=False).mean()
+    return 100 * (ema2 / abs2)
 
-    return sym, df5.sort_index(), df1h.sort_index()
+def compute_lrc_bands_daily(df_daily: pd.DataFrame, length: int = 300) -> pd.DataFrame:
+    # df_daily: index = day (datetime), cols: open/high/low/close/volume
+    def _lrc_last_point(values: np.ndarray) -> float:
+        w = np.asarray(values, dtype=float).ravel()
+        n = w.size
+        if n < 2 or not np.isfinite(w).all():
+            return np.nan
+        x = np.arange(n, dtype=float)
+        m, b = np.polyfit(x, w, 1)
+        return m * (n - 1) + b
 
-def compute_indicators_and_align(df5_full: pd.DataFrame, df1h_full: pd.DataFrame, lrc_len: int = 300):
-    """ 5m EMA, 1h EMA ve 1D LRC(300) (1h→1D) hesapla; LRC'yi 5m'e ffill ile eşle """
-    df5 = df5_full.copy()
-    df1h = df1h_full.copy()
+    def rolling_lrc(series: pd.Series, length: int) -> pd.Series:
+        return series.rolling(window=length, min_periods=length).apply(_lrc_last_point, raw=True)
 
-    # 5m EMA'lar
-    df5["ema7_5m"]  = ema(df5["close"], 7)
-    df5["ema13_5m"] = ema(df5["close"], 13)
-    df5["ema26_5m"] = ema(df5["close"], 26)
+    out = pd.DataFrame(index=df_daily.index)
+    out["lrc_high"] = rolling_lrc(df_daily["high"], length)
+    out["lrc_low"]  = rolling_lrc(df_daily["low"],  length)
+    return out
 
-    # 1h EMA'lar
-    df1h["ema7_1h"]  = ema(df1h["close"], 7)
-    df1h["ema13_1h"] = ema(df1h["close"], 13)
+# -----------------------------------------------------------
+# Candlestick yardımcıları
+# -----------------------------------------------------------
+def is_bull_engulf(prev: pd.Series, cur: pd.Series) -> bool:
+    # Bullish engulfing (basit): prev red, cur green, cur body prev body'sini sarar
+    if any(pd.isna([prev["open"], prev["close"], cur["open"], cur["close"]])):
+        return False
+    return (prev["close"] < prev["open"]) and (cur["close"] > cur["open"]) \
+        and (cur["close"] >= prev["open"]) and (cur["open"] <= prev["close"])
 
-    # 1h -> 1D
-    d1 = df1h.copy()
-    if d1.index.tz is None:
-        d1.index = d1.index.tz_localize("UTC")
-    else:
-        d1.index = d1.index.tz_convert("UTC")
-    d1 = d1.resample("1D", label="left", closed="left").agg(
-        {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-    ).dropna(subset=["open","high","low","close"])
+def is_bear_engulf(prev: pd.Series, cur: pd.Series) -> bool:
+    if any(pd.isna([prev["open"], prev["close"], cur["open"], cur["close"]])):
+        return False
+    return (prev["close"] > prev["open"]) and (cur["close"] < cur["open"]) \
+        and (cur["close"] <= prev["open"]) and (cur["open"] >= prev["close"])
 
-    # 1D LRC
-    bands_d1 = compute_lrc_bands(d1, length=int(lrc_len))
-    d1 = d1.join(bands_d1)
+def last_swing_low(df5: pd.DataFrame, i: int, lookback: int) -> Optional[float]:
+    i0 = max(0, i - lookback)
+    window = df5.iloc[i0:i+1]
+    return float(window["low"].min()) if len(window) else None
 
-    # 1D LRC'yi 5m'e ffill
-    df5["lrc_high"] = d1["lrc_high"].reindex(df5.index, method="ffill")
-    df5["lrc_low"]  = d1["lrc_low"].reindex(df5.index, method="ffill")
+def last_swing_high(df5: pd.DataFrame, i: int, lookback: int) -> Optional[float]:
+    i0 = max(0, i - lookback)
+    window = df5.iloc[i0:i+1]
+    return float(window["high"].max()) if len(window) else None
 
-    # 1h EMA'ları 5m'e ffill
-    h1 = df1h[["ema7_1h","ema13_1h"]].dropna().sort_index()
-    h1_aligned = h1.reindex(df5.index, method="ffill")
-    df5 = df5.join(h1_aligned)
+# -----------------------------------------------------------
+# Pozisyon/işlem datası
+# -----------------------------------------------------------
+@dataclass
+class Trade:
+    side: str                     # "long" | "short"
+    entry_time: pd.Timestamp
+    entry_price: float
+    qty: float
+    stop: float
+    tp: float
+    exit_time: Optional[pd.Timestamp] = None
+    exit_price: Optional[float] = None
+    exit_reason: Optional[str] = None  # "TP" | "SL" | "RuleExit"
+    fee_entry: float = 0.0
+    fee_exit: float = 0.0
 
-    return df5, d1
+    @property
+    def pnl_usd(self) -> float:
+        if self.exit_price is None:
+            return 0.0
+        direction = 1 if self.side == "long" else -1
+        gross = direction * (self.exit_price - self.entry_price) * self.qty
+        return gross - self.fee_entry - self.fee_exit
 
-def make_signals(df5: pd.DataFrame, use_lrc_long: bool, use_lrc_short: bool):
-    # EMA zorunlu koşullar
-    bull5  = (df5["ema7_5m"] > df5["ema13_5m"]) & (df5["ema13_5m"] > df5["ema26_5m"])
-    bear5  = (df5["ema7_5m"] < df5["ema13_5m"]) & (df5["ema13_5m"] < df5["ema26_5m"])
-    bull1h = (df5["ema7_1h"] > df5["ema13_1h"]) & df5["ema7_1h"].notna() & df5["ema13_1h"].notna()
-    bear1h = (df5["ema7_1h"] < df5["ema13_1h"]) & df5["ema7_1h"].notna() & df5["ema13_1h"].notna()
-
-    ema_ok_long  = bull5 & bull1h
-    ema_ok_short = bear5 & bear1h
-
-    # LRC tetikleyici (opsiyonel)
-    lrc_ok_long  = (~use_lrc_long)  | (df5["close"] > df5["lrc_high"])
-    lrc_ok_short = (~use_lrc_short) | (df5["close"] < df5["lrc_low"])
-
-    long_entry  = ema_ok_long  & lrc_ok_long
-    short_entry = ema_ok_short & lrc_ok_short
-
-    diag = {
-        "bull5": int(bull5.sum()),
-        "bear5": int(bear5.sum()),
-        "bull1h": int(bull1h.sum()),
-        "bear1h": int(bear1h.sum()),
-        "combo_long": int((ema_ok_long).sum()),
-        "combo_short": int((ema_ok_short).sum()),
-        "lrc_long_true": int(((df5["close"] > df5["lrc_high"]).fillna(False)).sum()),
-        "lrc_short_true": int(((df5["close"] < df5["lrc_low"]).fillna(False)).sum()),
-        "long_entry": int(long_entry.sum()),
-        "short_entry": int(short_entry.sum()),
-    }
-    out = df5.copy()
-    out["long_entry_sig"] = long_entry
-    out["short_entry_sig"] = short_entry
-    return out, diag
-
-def max_drawdown(equity: pd.Series):
-    roll_max = equity.cummax()
-    dd = (equity - roll_max) / roll_max.replace(0, np.nan)
-    return float(dd.min()) if len(dd) else 0.0
-
-def profit_factor(pl_list):
-    gains = sum(x for x in pl_list if x > 0)
-    losses = -sum(x for x in pl_list if x < 0)
-    return (gains / losses) if losses > 0 else np.inf if gains > 0 else 0.0
-
-
-# =========================================================
-# ---- Backtest (risk/sermaye/komisyon/kaldıraç dahil)
-# =========================================================
-def run_backtest_exe(
+# -----------------------------------------------------------
+# Backtest çekirdeği
+# -----------------------------------------------------------
+def simulate(
     df5: pd.DataFrame,
-    stop_on_swing: bool,
-    use_atr_stop: bool,
+    df1h: pd.DataFrame,
+    dfd: pd.DataFrame,
+    *,
+    allow_long: bool,
+    allow_short: bool,
+    use_lrc: bool,
+    use_tsi_dw: bool,
+    tsi_r: int,
+    tsi_s: int,
+    vol_filter: bool,
+    vol_factor: float,
+    need_engulf: bool,
+    need_pullback_ema13: bool,
     atr_period: int,
     atr_mult: float,
-    rr_tp: float,
-    starting_equity: float,
-    risk_mode: str,      # "fixed" | "percent"
-    risk_value: float,   # fixed $ veya yüzde
+    swing_lookback: int,
+    stop_offset_bps: float,
+    rr: float,
+    risk_mode: str,            # "dynamic_pct" | "fixed_usd"
+    risk_value: float,         # % veya USD
     leverage: float,
-    fee_rate_each_leg: float,  # % -> 0.05 = %0.05
-):
-    df = df5.copy()
-    # ATR (5m) yalnızca gerekirse
-    if use_atr_stop:
-        tr1 = (df["high"] - df["low"]).abs()
-        tr2 = (df["high"] - df["close"].shift()).abs()
-        tr3 = (df["low"]  - df["close"].shift()).abs()
-        tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        df["ATR"] = tr.rolling(atr_period, min_periods=atr_period).mean()
-
-    equity = starting_equity
-    position = None
-    entry_price = None
-    qty = 0.0
-    stop_price = None
-    tp_price = None
-    trades = []
-    equity_curve = []
-
-    price_tick = 0.0001  # sembole göre değişebilir; basit olması için küçük bir adım
-
-    pl_list = []
-    max_consec_win = 0
-    max_consec_loss = 0
-    cur_win = cur_loss = 0
-
-    for ts, row in df.iterrows():
-        close = float(row["close"])
-        high  = float(row["high"])
-        low   = float(row["low"])
-
-        # pozisyon yoksa — giriş
-        if position is None:
-            long_sig = bool(row.get("long_entry_sig", False))
-            short_sig = bool(row.get("short_entry_sig", False))
-
-            if long_sig or short_sig:
-                side = "long" if long_sig else "short"
-
-                # stop mesafesi
-                swing_stop = None
-                if stop_on_swing:
-                    if side == "long":
-                        swing_stop = low - price_tick
-                    else:
-                        swing_stop = high + price_tick
-
-                atr_stop = None
-                if use_atr_stop and not np.isnan(row.get("ATR", np.nan)):
-                    dist = float(row["ATR"]) * float(atr_mult)
-                    if side == "long":
-                        atr_stop = close - dist
-                    else:
-                        atr_stop = close + dist
-
-                # stop önceliği: swing > atr > yok
-                stop_price = swing_stop if swing_stop is not None else atr_stop
-
-                if stop_price is None or (side == "long" and stop_price >= close) or (side == "short" and stop_price <= close):
-                    # geçersiz stop (ters yönde), bu sinyali atla
-                    continue
-
-                stop_dist = (close - stop_price) if side == "long" else (stop_price - close)
-                if stop_dist <= 0:
-                    continue
-
-                # risk $ belirle
-                if risk_mode == "percent":
-                    risk_dollars = equity * (risk_value / 100.0)
-                else:
-                    risk_dollars = risk_value
-
-                if risk_dollars <= 0:
-                    continue
-
-                qty = risk_dollars / stop_dist  # risk tabanlı miktar
-
-                # kaldıraç/margin sınırı
-                notional = qty * close
-                max_notional = equity * leverage  # kullanılabilir en fazla notional (basit yaklaşım)
-                if notional > max_notional:
-                    # kıs
-                    qty = max_notional / close
-                    notional = qty * close
-                    # stop_dist aynı kalır; risk fiilen düşer
-
-                # TP
-                tp_dist = stop_dist * rr_tp
-                tp_price = (close + tp_dist) if side == "long" else (close - tp_dist)
-
-                # giriş komisyonu
-                entry_fee = notional * (fee_rate_each_leg / 100.0)
-
-                position = side
-                entry_price = close
-
-                trades.append({
-                    "time": ts, "type": "entry", "side": side,
-                    "price": entry_price, "qty": qty,
-                    "stop": stop_price, "tp": tp_price,
-                    "fee": entry_fee
-                })
-
-                # equity değişmez (fee, PnL bar kapanışında düşebilir) – burada düşürelim:
-                equity -= entry_fee
-                equity_curve.append({"time": ts, "equity": equity})
-
-        else:
-            # pozisyon açık — exit (önce stop, sonra TP)
-            if position == "long":
-                hit_stop = low <= stop_price if stop_price is not None else False
-                hit_tp   = high >= tp_price if tp_price is not None else False
-                exit_reason = None
-                exit_price = None
-                if hit_stop:
-                    exit_reason = "SL"
-                    exit_price = stop_price
-                elif hit_tp:
-                    exit_reason = "TP"
-                    exit_price = tp_price
-
-                if exit_price is not None:
-                    notional_exit = qty * exit_price
-                    exit_fee = notional_exit * (fee_rate_each_leg / 100.0)
-                    pnl = (exit_price - entry_price) * qty  # long
-
-                    # equity güncelle
-                    equity += pnl
-                    equity -= exit_fee
-
-                    trades.append({
-                        "time": ts, "type": "exit", "side": position,
-                        "price": exit_price, "qty": qty,
-                        "reason": exit_reason, "fee": exit_fee, "pnl": pnl
-                    })
-
-                    # win/loss serisi
-                    pl_list.append(pnl - 0.0)  # fee zaten düşüldü
-                    if pnl > 0:
-                        cur_win += 1; cur_loss = 0
-                    else:
-                        cur_loss += 1; cur_win = 0
-                    max_consec_win = max(max_consec_win, cur_win)
-                    max_consec_loss = max(max_consec_loss, cur_loss)
-
-                    # reset
-                    position = None; entry_price = None; qty = 0.0
-                    stop_price = None; tp_price = None
-
-                    equity_curve.append({"time": ts, "equity": equity})
-
-            elif position == "short":
-                hit_stop = high >= stop_price if stop_price is not None else False
-                hit_tp   = low  <= tp_price if tp_price is not None else False
-                exit_reason = None
-                exit_price = None
-                if hit_stop:
-                    exit_reason = "SL"
-                    exit_price = stop_price
-                elif hit_tp:
-                    exit_reason = "TP"
-                    exit_price = tp_price
-
-                if exit_price is not None:
-                    notional_exit = qty * exit_price
-                    exit_fee = notional_exit * (fee_rate_each_leg / 100.0)
-                    pnl = (entry_price - exit_price) * qty  # short
-
-                    equity += pnl
-                    equity -= exit_fee
-
-                    trades.append({
-                        "time": ts, "type": "exit", "side": position,
-                        "price": exit_price, "qty": qty,
-                        "reason": exit_reason, "fee": exit_fee, "pnl": pnl
-                    })
-
-                    pl_list.append(pnl - 0.0)
-                    if pnl > 0:
-                        cur_win += 1; cur_loss = 0
-                    else:
-                        cur_loss += 1; cur_win = 0
-                    max_consec_win = max(max_consec_win, cur_win)
-                    max_consec_loss = max(max_consec_loss, cur_loss)
-
-                    position = None; entry_price = None; qty = 0.0
-                    stop_price = None; tp_price = None
-
-                    equity_curve.append({"time": ts, "equity": equity})
-
-    # istatistikler
-    total_trades = sum(1 for t in trades if t["type"] == "exit")
-    wins = sum(1 for t in trades if t["type"] == "exit" and t.get("pnl", 0) > 0)
-    losses = total_trades - wins
-    winrate = round((wins / total_trades * 100) if total_trades else 0.0, 2)
-    pf = profit_factor(pl_list)
-    mdd = max_drawdown(pd.Series([e["equity"] for e in equity_curve])) if equity_curve else 0.0
-    total_pnl = sum(t.get("pnl", 0) for t in trades if t["type"] == "exit")
-
-    stats = {
-        "Toplam İşlem": total_trades,
-        "Kazanılan": wins,
-        "Kaybedilen": losses,
-        "Winrate %": winrate,
-        "Profit Factor": round(pf, 2) if np.isfinite(pf) else "∞",
-        "Toplam PnL ($)": round(total_pnl, 2),
-        "Başlangıç Sermaye": round(starting_equity, 2),
-        "Bitiş Sermaye": round(equity, 2),
-        "Max Win Streak": max_consec_win,
-        "Max Loss Streak": max_consec_loss,
-        "Max Drawdown %": round(mdd * 100.0, 2) if mdd else 0.0,
-    }
-
-    return stats, trades, pd.DataFrame(equity_curve).set_index("time") if equity_curve else pd.DataFrame()
-
-
-def plot_overview(df5: pd.DataFrame, sym: str, trades: list):
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-    fig.add_trace(go.Candlestick(
-        x=df5.index,
-        open=df5["open"], high=df5["high"], low=df5["low"], close=df5["close"],
-        name=f"{sym} 5m"
-    ), row=1, col=1)
+    fee_rate: float,           # her bacak %
+    start_dt: pd.Timestamp,
+    end_dt: pd.Timestamp,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
+    """
+    df5: 5m OHLCV (index=Datetime, cols: o,h,l,c,v)
+    df1h: 1h OHLCV (index=Datetime)
+    dfd: daily OHLCV (index=Date)
+    """
 
     # EMA'lar
-    fig.add_trace(go.Scatter(x=df5.index, y=df5["ema7_5m"], name="EMA7 (5m)", mode="lines"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df5.index, y=df5["ema13_5m"], name="EMA13 (5m)", mode="lines"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df5.index, y=df5["ema26_5m"], name="EMA26 (5m)", mode="lines"), row=1, col=1)
+    for L in [7, 13, 26]:
+        df5[f"ema{L}"] = ema(df5["close"], L)
+    df1h["ema7"] = ema(df1h["close"], 7)
+    df1h["ema13"] = ema(df1h["close"], 13)
 
-    # LRC bantları
-    if "lrc_high" in df5.columns and df5["lrc_high"].notna().any():
-        fig.add_trace(go.Scatter(x=df5.index, y=df5["lrc_high"], name="LRC High (1D,300)", mode="lines"), row=1, col=1)
-    if "lrc_low" in df5.columns and df5["lrc_low"].notna().any():
-        fig.add_trace(go.Scatter(x=df5.index, y=df5["lrc_low"], name="LRC Low (1D,300)", mode="lines"), row=1, col=1)
+    # ATR (5m)
+    df5["atr"] = atr(df5, atr_period)
 
-    # İşlem işaretleri
-    if trades:
-        entries_long_x = [t["time"] for t in trades if t["type"]=="entry" and t["side"]=="long"]
-        entries_long_y = [df5.loc[x, "close"] for x in entries_long_x]
-        entries_short_x = [t["time"] for t in trades if t["type"]=="entry" and t["side"]=="short"]
-        entries_short_y = [df5.loc[x, "close"] for x in entries_short_x]
-        exits_x = [t["time"] for t in trades if t["type"]=="exit"]
-        exits_y = [df5.loc[x, "close"] if x in df5.index else t["price"] for t in trades if t["type"]=="exit"]
+    # Hacim ort (5m)
+    df5["vol_ma20"] = df5["volume"].rolling(20, min_periods=20).mean()
 
-        if entries_long_x:
-            fig.add_trace(go.Scatter(x=entries_long_x, y=entries_long_y, mode="markers",
-                                     name="Long Entry", marker=dict(symbol="triangle-up", size=9)), row=1, col=1)
-        if entries_short_x:
-            fig.add_trace(go.Scatter(x=entries_short_x, y=entries_short_y, mode="markers",
-                                     name="Short Entry", marker=dict(symbol="triangle-down", size=9)), row=1, col=1)
-        if exits_x:
-            fig.add_trace(go.Scatter(x=exits_x, y=exits_y, mode="markers",
-                                     name="Exit", marker=dict(symbol="x", size=8)), row=1, col=1)
+    # TSI (D & W)
+    if use_tsi_dw:
+        tsi_d = tsi(dfd["close"], tsi_r, tsi_s)
+        dfd["tsi_d"] = tsi_d
+        # weekly
+        dfw = dfd.resample("W").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+        dfw["tsi_w"] = tsi(dfw["close"], tsi_r, tsi_s)
+    else:
+        dfd["tsi_d"] = np.nan
+        dfw = dfd.resample("W").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+        dfw["tsi_w"] = np.nan
 
-    # Hacim
-    if "volume" in df5.columns:
-        fig.add_trace(go.Bar(x=df5.index, y=df5["volume"], name="Volume"), row=2, col=1)
+    # LRC (günlük)
+    if use_lrc:
+        bands = compute_lrc_bands_daily(dfd, 300)
+        dfd = dfd.join(bands)
 
-    fig.update_layout(height=760, margin=dict(l=40, r=20, t=40, b=40))
-    st.plotly_chart(fig, use_container_width=True)
+    equity = []
+    trades: List[Trade] = []
+    cash = 10_000_000.0  # teknik olarak "nakit" değil, burada sadece PnL ekliyoruz
+    equity_base = 0.0    # simpliﬁed; gerçek equity için kasa dışarıdan verilecek
+    realized_pnl = 0.0
 
+    position: Optional[Trade] = None
 
-# =========================================================
-# ---- UI
-# =========================================================
-st.title("📊 LRC(1D,300) + EMA Backtest")
+    # Hazır referanslar (lookup)
+    # 1h ve D eşleşmesi için en yakın geçmiş barı alacağız
+    def get_1h_row(ts):
+        return df1h.loc[:ts].iloc[-1] if (df1h.index <= ts).any() else None
 
-# Senin linklerin (varsayılan)
-DEFAULT_FUTURES_URL = "https://www.dropbox.com/scl/fi/diznny37aq4t88vf62umy/binance_futures_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet?rlkey=4umoh63qiz3fh0v7xuu86oo5n&st=5wu5h1x1&dl=0"
-DEFAULT_SPOT_URL    = "https://www.dropbox.com/scl/fi/eavvv8z452i0b6x1c2a5r/binance_spot_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet?rlkey=swsjkpbp22v4vj68ggzony8yw&st=2sww3kao&dl=0"
+    def get_d_row(ts):
+        day = pd.Timestamp(year=ts.year, month=ts.month, day=ts.day)
+        # daily index gün saat 00:00; en son günü bul
+        return dfd.loc[:day].iloc[-1] if (dfd.index <= day).any() else None
 
-data_source = st.radio("Veri kaynağı", ["Futures (parquet)", "Spot (parquet)"], index=0, horizontal=True)
-url_input = st.text_input("Parquet Dropbox linki", value=DEFAULT_FUTURES_URL if data_source.startswith("Futures") else DEFAULT_SPOT_URL)
+    # İşlem yaratımında risk'e göre adet hesaplama
+    def compute_position_qty(side: str, entry: float, stop: float,
+                             equity_now: float) -> float:
+        stop_dist = abs(entry - stop)
+        if stop_dist <= 0 or not np.isfinite(stop_dist):
+            return 0.0
+        if risk_mode == "dynamic_pct":
+            risk_usd = equity_now * (risk_value / 100.0)
+        else:
+            risk_usd = risk_value
+        qty = risk_usd / stop_dist
+        # kaldıraç/marjin sınırı: notional/leverage <= equity_now
+        notional = qty * entry
+        max_notional = equity_now * leverage
+        if notional > max_notional:
+            qty = max_notional / entry
+        return max(qty, 0.0)
 
-col_tf1, col_tf2 = st.columns(2)
-with col_tf1:
-    lrc_len = st.number_input("LRC(1D) pencere (gün)", min_value=50, max_value=600, value=300, step=10)
-with col_tf2:
-    rr_tp = st.number_input("Risk/Ödül (TP/SL oranı)", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
+    # Basit equity (başlangıç sermayesini UI'dan alacağız; burada sadece PnL toplanacak)
+    eq = 0.0
 
-st.markdown("### Filtreler")
-col_f1, col_f2, col_f3 = st.columns(3)
-with col_f1:
-    use_lrc_long  = st.checkbox("LRC Long filtresi (Close > LRC_HIGH)", value=False)
-with col_f2:
-    use_lrc_short = st.checkbox("LRC Short filtresi (Close < LRC_LOW)", value=False)
-with col_f3:
-    st.info("EMA koşulları zorunlu: 5m (7>13>26) + 1h (7>13). LRC tikleri opsiyonel tetikleyici.")
+    # Ana döngü
+    for i in range(len(df5)):
+        ts = df5.index[i]
+        if ts < start_dt or ts > end_dt:
+            # Warm-up veya aralık dışı
+            continue
 
-st.markdown("### Stop seçenekleri")
-col_s1, col_s2, col_s3 = st.columns(3)
-with col_s1:
-    stop_on_swing = st.checkbox("Swing stop (son swing low/high çevresi)", value=True)
-with col_s2:
-    use_atr_stop = st.checkbox("ATR stop kullan", value=False)
-with col_s3:
-    atr_period = st.number_input("ATR periyodu (5m)", min_value=5, max_value=200, value=14, step=1)
-atr_mult = st.number_input("ATR çarpanı (stop mesafesi için)", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
+        row5 = df5.iloc[i]
+        # 1h teyit
+        row1h = get_1h_row(ts)
+        if row1h is None or pd.isna(row1h["ema7"]) or pd.isna(row1h["ema13"]):
+            continue
 
-st.markdown("### Sermaye & Risk")
-col_r1, col_r2, col_r3 = st.columns(3)
-with col_r1:
-    starting_equity = st.number_input("Başlangıç Sermaye (USDT)", min_value=10.0, value=1000.0, step=10.0)
-with col_r2:
-    risk_mode = st.selectbox("Risk modu", ["Sabit $", "Yüzde %"], index=1)
-with col_r3:
-    risk_value = st.number_input("Risk (Sabit $ veya %)", min_value=0.1, value=2.0, step=0.1)
+        # EMA şartları
+        ema_ok_long  = (row5["ema7"] > row5["ema13"] > row5["ema26"]) and (row1h["ema7"] > row1h["ema13"])
+        ema_ok_short = (row5["ema7"] < row5["ema13"] < row5["ema26"]) and (row1h["ema7"] < row1h["ema13"])
 
-col_e1, col_e2 = st.columns(2)
-with col_e1:
-    leverage = st.number_input("Kaldıraç (x)", min_value=1.0, value=10.0, step=1.0)
-with col_e2:
-    fee_rate_each_leg = st.number_input("Komisyon (her bacak, %)", min_value=0.0, value=0.05, step=0.01, help="%0.05 = 0.05 yazınız")
+        # LRC şartı
+        lrc_pass_long = True
+        lrc_pass_short = True
+        if use_lrc:
+            drow = get_d_row(ts)
+            if drow is None or (("lrc_high" not in drow) or (pd.isna(drow["lrc_high"]) or pd.isna(drow["lrc_low"]))):
+                lrc_pass_long = lrc_pass_short = False
+            else:
+                lrc_pass_long  = row5["close"] > drow["lrc_high"]
+                lrc_pass_short = row5["close"] < drow["lrc_low"]
 
-col_d1, col_d2 = st.columns(2)
-with col_d1:
-    start_date = st.date_input("Başlangıç", value=dt.date(2023, 1, 1))
-with col_d2:
-    end_date = st.date_input("Bitiş", value=dt.date(2023, 12, 31))
+        # TSI D+W şartı
+        tsi_pass_long = True
+        tsi_pass_short = True
+        if use_tsi_dw:
+            drow = get_d_row(ts)
+            # weekly karşılığı (en yakın geçmiş Pazar kapanışı)
+            wrow = dfw.loc[:ts].iloc[-1] if (dfw.index <= ts).any() else None
+            if drow is None or wrow is None:
+                tsi_pass_long = tsi_pass_short = False
+            else:
+                tsi_pass_long  = (drow["tsi_d"] > 0) and (wrow["tsi_w"] > 0)
+                tsi_pass_short = (drow["tsi_d"] < 0) and (wrow["tsi_w"] < 0)
 
-run = st.button("Backtest Çalıştır")
+        # Hacim filtresi
+        vol_pass = True
+        if vol_filter:
+            if pd.isna(row5["vol_ma20"]):
+                vol_pass = False
+            else:
+                vol_pass = row5["volume"] >= vol_factor * row5["vol_ma20"]
+
+        # Engulf/pullback
+        engulf_pass_long = engulf_pass_short = True
+        if need_engulf and i >= 1:
+            prev = df5.iloc[i-1][["open","high","low","close"]]
+            cur  = row5[["open","high","low","close"]]
+            engulf_pass_long  = is_bull_engulf(prev, cur)
+            engulf_pass_short = is_bear_engulf(prev, cur)
+
+        pullback_pass_long = pullback_pass_short = True
+        if need_pullback_ema13:
+            pullback_pass_long  = row5["low"]  <= row5["ema13"]
+            pullback_pass_short = row5["high"] >= row5["ema13"]
+
+        # Çıkış takip (pozisyon açıksa önce stop/tp kontrolü)
+        if position is not None:
+            # Bu bar içinde stop veya tp görüldü mü (bar-internal basit kontrol)
+            if position.side == "long":
+                hit_sl = row5["low"]  <= position.stop
+                hit_tp = row5["high"] >= position.tp
+                exit_reason = None
+                exit_price = None
+                if hit_sl and hit_tp:
+                    # konservatif: önce SL
+                    exit_reason = "SL"
+                    exit_price = position.stop
+                elif hit_sl:
+                    exit_reason = "SL"
+                    exit_price = position.stop
+                elif hit_tp:
+                    exit_reason = "TP"
+                    exit_price = position.tp
+
+                # Kurala göre çıkış (EMA/LRC/TSI bozulduysa) – sadece SL/TP olmadıysa
+                if exit_reason is None:
+                    rule_ok_long = ema_ok_long and (not use_lrc or lrc_pass_long) and (not use_tsi_dw or tsi_pass_long)
+                    if not rule_ok_long:
+                        exit_reason = "RuleExit"
+                        exit_price = row5["close"]
+
+                if exit_reason:
+                    fee_exit = (fee_rate / 100.0) * (exit_price * position.qty)
+                    position.exit_time = ts
+                    position.exit_price = exit_price
+                    position.exit_reason = exit_reason
+                    position.fee_exit = fee_exit
+                    trades.append(position)
+                    eq += position.pnl_usd
+                    position = None
+
+            else:  # short
+                hit_sl = row5["high"] >= position.stop
+                hit_tp = row5["low"]  <= position.tp
+                exit_reason = None
+                exit_price = None
+                if hit_sl and hit_tp:
+                    exit_reason = "SL"
+                    exit_price = position.stop
+                elif hit_sl:
+                    exit_reason = "SL"
+                    exit_price = position.stop
+                elif hit_tp:
+                    exit_reason = "TP"
+                    exit_price = position.tp
+
+                if exit_reason is None:
+                    rule_ok_short = ema_ok_short and (not use_lrc or lrc_pass_short) and (not use_tsi_dw or tsi_pass_short)
+                    if not rule_ok_short:
+                        exit_reason = "RuleExit"
+                        exit_price = row5["close"]
+
+                if exit_reason:
+                    fee_exit = (fee_rate / 100.0) * (exit_price * position.qty)
+                    position.exit_time = ts
+                    position.exit_price = exit_price
+                    position.exit_reason = exit_reason
+                    position.fee_exit = fee_exit
+                    trades.append(position)
+                    eq += position.pnl_usd
+                    position = None
+
+        # Giriş – eğer pozisyon yoksa
+        if position is None:
+            # Long adayı
+            if allow_long and ema_ok_long and lrc_pass_long and tsi_pass_long and vol_pass and engulf_pass_long and pullback_pass_long:
+                # stop = max(swing_low - offset, entry - ATR*mult)
+                entry = row5["close"]
+                sl_swing = last_swing_low(df5, i-1, swing_lookback)
+                if sl_swing is None or not np.isfinite(sl_swing):
+                    pass  # giriş atla
+                else:
+                    offset = entry * (stop_offset_bps / 10_000.0)
+                    sl1 = sl_swing - offset
+                    atr_val = row5["atr"]
+                    sl2 = entry - atr_mult * atr_val if np.isfinite(atr_val) else entry * 0.99
+                    stop = min(sl1, sl2)  # long için daha aşağıdaki (daha geniş) stop
+                    # TP
+                    sl_dist = entry - stop
+                    if sl_dist <= 0:
+                        pass
+                    else:
+                        tp = entry + rr * sl_dist
+                        # boyut
+                        qty = compute_position_qty("long", entry, stop, equity_now=max(eq, 1.0))
+                        if qty > 0:
+                            fee_entry = (fee_rate / 100.0) * (entry * qty)
+                            position = Trade(side="long", entry_time=ts, entry_price=entry, qty=qty,
+                                             stop=stop, tp=tp, fee_entry=fee_entry)
+
+            # Short adayı
+            if (position is None) and allow_short and ema_ok_short and lrc_pass_short and tsi_pass_short and vol_pass and engulf_pass_short and pullback_pass_short:
+                entry = row5["close"]
+                sh_swing = last_swing_high(df5, i-1, swing_lookback)
+                if sh_swing is None or not np.isfinite(sh_swing):
+                    pass
+                else:
+                    offset = entry * (stop_offset_bps / 10_000.0)
+                    sl1 = sh_swing + offset
+                    atr_val = row5["atr"]
+                    sl2 = entry + atr_mult * atr_val if np.isfinite(atr_val) else entry * 1.01
+                    stop = max(sl1, sl2)  # short için daha yukarıdaki (daha geniş) stop
+                    sl_dist = stop - entry
+                    if sl_dist <= 0:
+                        pass
+                    else:
+                        tp = entry - rr * sl_dist
+                        qty = compute_position_qty("short", entry, stop, equity_now=max(eq, 1.0))
+                        if qty > 0:
+                            fee_entry = (fee_rate / 100.0) * (entry * qty)
+                            position = Trade(side="short", entry_time=ts, entry_price=entry, qty=qty,
+                                             stop=stop, tp=tp, fee_entry=fee_entry)
+
+        equity.append({"time": ts, "equity": eq})
+
+    # Kapanışta açık pozisyon varsa kapat
+    if position is not None:
+        last_close = df5.iloc[-1]["close"]
+        fee_exit = (fee_rate / 100.0) * (last_close * position.qty)
+        position.exit_time = df5.index[-1]
+        position.exit_price = last_close
+        position.exit_reason = "LastBarExit"
+        position.fee_exit = fee_exit
+        trades.append(position)
+        eq += position.pnl_usd
+        position = None
+
+    equity_df = pd.DataFrame(equity).set_index("time")
+
+    # İstatistikler
+    tr_df = pd.DataFrame([{
+        "side": t.side,
+        "entry_time": t.entry_time,
+        "entry": t.entry_price,
+        "exit_time": t.exit_time,
+        "exit": t.exit_price,
+        "exit_reason": t.exit_reason,
+        "qty": t.qty,
+        "stop": t.stop,
+        "tp": t.tp,
+        "pnl_usd": t.pnl_usd
+    } for t in trades if t.exit_time is not None])
+
+    stats = compute_stats(tr_df)
+    return tr_df, equity_df, stats
+
+def compute_stats(trades_df: pd.DataFrame) -> Dict[str, float]:
+    if trades_df.empty:
+        return {
+            "trades": 0, "win_rate": 0.0, "net_pnl": 0.0, "avg_pnl": 0.0,
+            "max_consec_win": 0, "max_consec_loss": 0, "max_dd": 0.0
+        }
+    wins = (trades_df["pnl_usd"] > 0).astype(int)
+    losses = (trades_df["pnl_usd"] < 0).astype(int)
+    trades = len(trades_df)
+    win_rate = 100.0 * wins.sum() / trades
+    net_pnl = trades_df["pnl_usd"].sum()
+    avg_pnl = trades_df["pnl_usd"].mean()
+
+    # consecutive streaks
+    max_w, max_l = 0, 0
+    cur_w, cur_l = 0, 0
+    for pnl in trades_df["pnl_usd"]:
+        if pnl > 0:
+            cur_w += 1; max_w = max(max_w, cur_w)
+            cur_l = 0
+        elif pnl < 0:
+            cur_l += 1; max_l = max(max_l, cur_l)
+            cur_w = 0
+        else:
+            cur_w = cur_l = 0
+
+    # max drawdown (equity akümüle edilerek)
+    eq = trades_df["pnl_usd"].cumsum()
+    peak = eq.cummax()
+    dd = eq - peak
+    max_dd = dd.min()
+
+    return {
+        "trades": trades,
+        "win_rate": win_rate,
+        "net_pnl": net_pnl,
+        "avg_pnl": avg_pnl,
+        "max_consec_win": int(max_w),
+        "max_consec_loss": int(max_l),
+        "max_dd": float(max_dd),
+    }
+
+# -----------------------------------------------------------
+# UI
+# -----------------------------------------------------------
+st.title("📊 EMA + 1H Onay + (opsiyonel) LRC / TSI / Hacim / Engulf Backtest")
+
+with st.expander("🔗 Veri Kaynağı", expanded=True):
+    col0, col1 = st.columns(2)
+    with col0:
+        mode = st.radio("Kaynak", ["Futures", "Spot"], horizontal=True)
+        url_input = st.text_input("Dropbox Parquet Linki", DEFAULT_FUTURES_URL if mode=="Futures" else DEFAULT_SPOT_URL)
+    with col1:
+        if st.button("🔁 Önbelleği temizle"):
+            st.cache_data.clear()
+            st.success("Önbellek temizlendi.")
+
+df = None
+if url_input:
+    df = load_parquet_from_dropbox(url_input)
+
+if df is None or df.empty:
+    st.stop()
+
+# Sembol listesi
+symbols = sorted(list(df["symbol"].dropna().unique()))
+if not symbols:
+    symbols = ["BTCUSDT", "ETHUSDT"]
+
+colA, colB, colC = st.columns(3)
+with colA:
+    symbol = st.selectbox("Sembol", symbols, index=(symbols.index("ETHUSDT") if "ETHUSDT" in symbols else 0))
+with colB:
+    start_date = st.date_input("Başlangıç", pd.Timestamp("2023-01-01"))
+with colC:
+    end_date = st.date_input("Bitiş", pd.Timestamp("2024-01-01"))
+
+# Warm-up uyarısı
+st.caption("⚠️ LRC(300) ve 5m/1h EMA için yeterli warm-up gereklidir. Kod, başlangıçtan "
+           "en az 300 günlük (günlük LRC) ve yeterli EMA/ATR geçmişini **otomatik** ekler.")
+
+# Sembolün verisini ayrıştır
+df_sym = df[df["symbol"] == symbol].copy()
+df_sym["time"] = pd.to_datetime(df_sym["time"])
+df_sym = df_sym.sort_values("time")
+
+# 5m ve 1h veri
+if (df_sym["interval_norm"] != "").any():
+    df5 = df_sym[df_sym["interval_norm"].isin(["5m","5min","5"])]
+    df1h = df_sym[df_sym["interval_norm"].isin(["1h","60","60m"])]
+    # Güvenli olsun diye yine resample'la normalize et
+    df5 = df5.set_index("time").sort_index().resample("5T").last()[["open","high","low","close","volume"]].dropna()
+    df1h = df1h.set_index("time").sort_index().resample("1H").last()[["open","high","low","close","volume"]].dropna()
+else:
+    # Toplu tek frekans ise resample
+    base = df_sym.set_index("time").sort_index()[["open","high","low","close","volume"]]
+    df5 = base.resample("5T").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+    df1h = base.resample("1H").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+
+# Günlük (1h'den resample – talebin)
+dfd_all = df1h.resample("1D").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+
+# Warm-up: LRC için 300 gün geri
+warm_days = 320
+start_dt = pd.Timestamp(start_date)
+end_dt   = pd.Timestamp(end_date) + pd.Timedelta(hours=23, minutes=59)
+
+warm_start = start_dt - pd.Timedelta(days=warm_days)
+df5_w = df5.loc[warm_start:end_dt].copy()
+df1h_w = df1h.loc[warm_start:end_dt].copy()
+dfd_w = dfd_all.loc[:end_dt].copy()  # günlüklere warm-start gerekmesin diye üstten alıyoruz
+
+with st.expander("⚙️ Kurallar & Risk Ayarları", expanded=True):
+    # Yön ve filtreler
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        allow_long = st.checkbox("Long Aç", value=True)
+        allow_short = st.checkbox("Short Aç", value=True)
+    with c2:
+        use_lrc = st.checkbox("LRC (D, 300) filtresi", value=False)
+        use_tsi_dw = st.checkbox("TSI D+W filtresi", value=False)
+    with c3:
+        vol_filter = st.checkbox("Hacim filtresi (≥ k × MA20)", value=False)
+        vol_factor = st.number_input("k (hacim kat sayısı)", value=1.0, step=0.1)
+    with c4:
+        need_engulf = st.checkbox("Engulf şartı", value=False)
+        need_pullback = st.checkbox("EMA13'e çekilme şartı", value=False)
+
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        tsi_r = st.number_input("TSI r", value=25, step=1, min_value=1)
+        tsi_s = st.number_input("TSI s", value=13, step=1, min_value=1)
+    with c6:
+        atr_period = st.number_input("ATR Periyodu (5m)", value=14, step=1, min_value=1)
+        atr_mult = st.number_input("ATR Çarpanı (Stop)", value=2.0, step=0.1, min_value=0.1)
+        swing_lookback = st.number_input("Swing lookback (bar)", value=20, step=1, min_value=2)
+    with c7:
+        stop_offset_bps = st.number_input("Stop offset (bps)", value=5.0, step=1.0, help="1 bps = 0.01%")
+        rr = st.number_input("R:R (TP/SL)", value=2.0, step=0.1, min_value=0.1)
+
+with st.expander("💰 Sermaye & Komisyon", expanded=True):
+    c8, c9, c10, c11 = st.columns(4)
+    with c8:
+        risk_mode = st.selectbox("Risk modu", ["dynamic_pct", "fixed_usd"], format_func=lambda x: "Dinamik % (equity)" if x=="dynamic_pct" else "Sabit USD")
+    with c9:
+        if risk_mode == "dynamic_pct":
+            risk_value = st.number_input("Risk %", value=2.0, step=0.1, min_value=0.1)
+        else:
+            risk_value = st.number_input("Sabit risk (USD)", value=100.0, step=10.0, min_value=10.0)
+    with c10:
+        leverage = st.number_input("Kaldıraç (x)", value=10.0, step=1.0, min_value=1.0)
+    with c11:
+        fee_rate = st.number_input("Komisyon (her bacak, %)", value=0.04, step=0.01, min_value=0.0)
+
+run = st.button("▶ Backtest Çalıştır")
 
 if run:
-    df_all = load_parquet_from_dropbox(url_input)
-    if df_all.empty:
+    if df5_w.empty or df1h_w.empty:
+        st.error("Veri aralığı boş.")
         st.stop()
 
-    sym, df5_full, df1h_full = pick_symbol_timeframes(df_all)
-
-    # indikatörleri tüm data üzerinde (warm-up) hesapla
-    df5_full, d1_full = compute_indicators_and_align(df5_full, df1h_full, lrc_len=int(lrc_len))
-
-    # LRC warm-up uyarısı
-    try:
-        days_have = int(d1_full[["lrc_high","lrc_low"]].dropna().shape[0])
-        if days_have < int(lrc_len):
-            st.warning(f"LRC(1D) için yeterli gün yok: {days_have}/{int(lrc_len)}. LRC filtreleri açıksa sinyal sayısı düşebilir.")
-    except Exception:
-        pass
-
-    # Tarih filtresi
-    st.caption(f"Seçilen aralık: {start_date} → {end_date}")
-    df5 = df5_full.loc[str(start_date):str(end_date)].copy()
-
-    # sinyaller
-    df5_sig, diag = make_signals(df5, use_lrc_long, use_lrc_short)
-
-    st.caption(
-        f"bull5:{diag['bull5']} | bear5:{diag['bear5']} | "
-        f"bull1h:{diag['bull1h']} | bear1h:{diag['bear1h']} | "
-        f"EMA-long:{diag['combo_long']} | EMA-short:{diag['combo_short']} | "
-        f"LRC_long_true:{diag['lrc_long_true']} | LRC_short_true:{diag['lrc_short_true']} | "
-        f"long_entry:{diag['long_entry']} | short_entry:{diag['short_entry']}"
+    # Simülasyon
+    trades_df, equity_df, stats = simulate(
+        df5=df5_w, df1h=df1h_w, dfd=dfd_w,
+        allow_long=allow_long, allow_short=allow_short,
+        use_lrc=use_lrc, use_tsi_dw=use_tsi_dw, tsi_r=tsi_r, tsi_s=tsi_s,
+        vol_filter=vol_filter, vol_factor=vol_factor,
+        need_engulf=need_engulf, need_pullback_ema13=need_pullback,
+        atr_period=atr_period, atr_mult=atr_mult,
+        swing_lookback=swing_lookback, stop_offset_bps=stop_offset_bps,
+        rr=rr, risk_mode=risk_mode, risk_value=risk_value,
+        leverage=leverage, fee_rate=fee_rate,
+        start_dt=pd.Timestamp(start_date), end_dt=pd.Timestamp(end_date) + pd.Timedelta(hours=23, minutes=59)
     )
 
-    if diag["long_entry"] + diag["short_entry"] == 0:
-        st.warning("Bu kurallarla bu aralıkta giriş sinyali üretilmedi. (LRC tiklerini kapatmayı, aralığı veya parametreleri değiştirin.)")
+    # Özet
+    st.subheader("📈 Sonuç Özeti")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Toplam İşlem", int(stats.get("trades", 0)))
+    m2.metric("Win Rate", f"{stats.get('win_rate', 0.0):.2f}%")
+    m3.metric("Net PnL (USD)", f"{stats.get('net_pnl', 0.0):.2f}")
+    m4.metric("Ort. PnL (USD)", f"{stats.get('avg_pnl', 0.0):.2f}")
+    m5.metric("Max Consec Win", int(stats.get("max_consec_win", 0)))
+    m6.metric("Max Consec Loss", int(stats.get("max_consec_loss", 0)))
 
-    # yürütme
-    stats, trades, eq_curve = run_backtest_exe(
-        df5_sig,
-        stop_on_swing=stop_on_swing,
-        use_atr_stop=use_atr_stop,
-        atr_period=int(atr_period),
-        atr_mult=float(atr_mult),
-        rr_tp=float(rr_tp),
-        starting_equity=float(starting_equity),
-        risk_mode="percent" if risk_mode.startswith("Yüzde") else "fixed",
-        risk_value=float(risk_value),
-        leverage=float(leverage),
-        fee_rate_each_leg=float(fee_rate_each_leg),
-    )
+    # Equity grafiği
+    st.subheader("Equity Eğrisi")
+    if equity_df.empty:
+        st.info("Equity verisi boş.")
+    else:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=equity_df.index, y=equity_df["equity"], mode="lines", name="Equity"))
+        fig.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Özet")
-    st.write(stats)
+    # İşlem günlüğü
+    st.subheader("İşlem Günlüğü")
+    if trades_df.empty:
+        st.info("İşlem bulunmadı.")
+    else:
+        st.dataframe(trades_df.tail(50), use_container_width=True)
 
-    # grafik
-    plot_overview(df5_sig, sym, trades)
-
-    # equity grafiği
-    if not eq_curve.empty:
-        fig_e = go.Figure()
-        fig_e.add_trace(go.Scatter(x=eq_curve.index, y=eq_curve["equity"], mode="lines", name="Equity"))
-        fig_e.update_layout(title="Equity Curve", height=360, margin=dict(l=40, r=20, t=40, b=40))
-        st.plotly_chart(fig_e, use_container_width=True)
-
-    # CSV çıktıları
-    try:
-        os.makedirs("artifacts", exist_ok=True)
-        pd.DataFrame(trades).to_csv("artifacts/backtest_trades.csv", index=False)
-        if not eq_curve.empty:
-            eq_curve.to_csv("artifacts/backtest_equity.csv")
-        st.success("Kaydedildi: artifacts/backtest_trades.csv ve artifacts/backtest_equity.csv")
-    except Exception as e:
-        st.warning(f"CSV yazılamadı: {e}")
+        # CSV kaydet + indir
+        out_csv = os.path.join(RESULTS_DIR, f"trades_{symbol}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        trades_df.to_csv(out_csv, index=False)
+        st.success(f"CSV kaydedildi: {out_csv}")
+        st.download_button("CSV indir", data=trades_df.to_csv(index=False), file_name=os.path.basename(out_csv), mime="text/csv")
