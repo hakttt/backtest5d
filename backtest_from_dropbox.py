@@ -18,6 +18,7 @@ import pandas as pd
 import streamlit as st
 import tempfile
 from typing import Tuple
+from datetime import date  # <-- RANGE default'u için eklendi
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="BTC/ETH Backtest (Dropbox Parquet)", layout="wide")
@@ -110,7 +111,6 @@ def compute_lrc_bands(df: pd.DataFrame, length: int = 300) -> pd.DataFrame:
 def cached_lrc_bands(df_1d: pd.DataFrame, length: int = 300) -> pd.DataFrame:
     if df_1d is None or df_1d.empty:
         return pd.DataFrame(index=getattr(df_1d, "index", None))
-    # Basit içerik hash'i ile cache anahtarı
     key = (str(df_1d.index.min()) + str(df_1d.index.max()) +
            str(float(df_1d["close"].sum())))
     _ = hashlib.md5(key.encode()).hexdigest()
@@ -130,15 +130,6 @@ def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
 def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
                                     atr_len=14, regime_filter=None,
                                     use_lrc=False, allow_long=True, allow_short=True):
-    """
-    Sabit EMA çekirdeği:
-      - 5m: EMA(7)>EMA(13)>EMA(26) => long ; EMA(7)<EMA(13)<EMA(26) => short
-      - 1h: yön teyidi (EMA7 vs EMA13)
-    Opsiyonel LRC filtresi (1D LRC-300):
-      - close > lrc_high -> sadece long
-      - close < lrc_low  -> sadece short
-      - aradaysa -> iki yön de engellenir
-    """
     ema_fast, ema_mid, ema_slow = 7, 13, 26
 
     out = df_5m.copy()
@@ -176,7 +167,7 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
     elif regime_filter == "short-only":
         long_raw = pd.Series(False, index=out.index)
 
-    out["ATR"] = atr(out, atr_len)
+    out["ATR"] = atr(out,  atr_len)
     out["long_signal"]  = long_raw.fillna(False)
     out["short_signal"] = short_raw.fillna(False)
     return out
@@ -227,14 +218,6 @@ def backtest(df: pd.DataFrame,
              leverage: float = 10.0,
              swing_lookback: int = 10,
              pip_size: float = 0.01) -> Tuple[pd.DataFrame, dict, pd.DataFrame]:
-    """
-    - Giriş: sinyal mumunun kapanışı sonrası bir sonraki barın açılışı (offset bps uygulanır).
-    - Stop tipi:
-        * Swing: SL = son swing low/high ± 1 pip, TP = giriş ± %TP
-        * ATR  : SL = ATR × mult, TP = RR × SL
-    - Komisyon: (nominal * fee_rate) açılış + kapanış.
-    - Pozisyon boyutu: fixed nominal veya equity*risk_pct (her ikisi de leverage ile çarpılır).
-    """
     o, h, l, c = df["open"], df["high"], df["low"], df["close"]
     atrv = df.get("ATR", pd.Series(index=df.index, dtype=float)).fillna(method="ffill")
 
@@ -329,7 +312,6 @@ def backtest(df: pd.DataFrame,
     trades_df = pd.DataFrame(trades)
     eq_df = pd.DataFrame(eq_curve, columns=["time", "equity"]).set_index("time")
 
-    # Özet istatistikler + consecutive seriler
     if trades_df.empty:
         stats = {
             "trades": 0, "wins": 0, "losses": 0,
@@ -375,7 +357,13 @@ with st.sidebar:
     regime = st.selectbox("Rejim filtresi", ["Hepsi","long-only","short-only"], index=0)
 
     st.subheader("Tarih Aralığı")
-    date_range = st.date_input("İşlem aralığı (UTC)", value=None, help="Başlangıç ve bitiş tarihi seçiniz")
+    # ---> DÜZELTME: İki uçlu (başlangıç, bitiş) range default'u geri getirildi
+    default_range = (date(2020, 1, 1), date.today())
+    date_range = st.date_input(
+        "İşlem aralığı (UTC)",
+        value=default_range,  # iki tarih -> range picker
+        help="Başlangıç ve bitiş tarihi seçiniz"
+    )
 
     st.subheader("Opsiyonel LRC Filtre")
     use_lrc = st.checkbox("LRC filtresi (1D LRC-300)", value=False)
@@ -426,19 +414,18 @@ if run_btn:
         st.error("5m veya 1h veri yok.")
         st.stop()
 
-    # --- Tarih aralığı uygula (varsa) ---
-    if date_range:
-        if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-            start_date = pd.Timestamp(date_range[0], tz="UTC")
-            end_date = pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)
-        else:
-            start_date = pd.Timestamp(date_range, tz="UTC")
-            end_date = start_date + pd.Timedelta(days=1)
-        df_5m = df_5m_all.loc[(df_5m_all.index >= start_date) & (df_5m_all.index < end_date)].copy()
-        df_1h = df_1h_all.loc[(df_1h_all.index >= start_date) & (df_1h_all.index < end_date)].copy()
-        df_1d = df_1d_all.loc[(df_1d_all.index >= start_date) & (df_1d_all.index < end_date)].copy() if has_1d else pd.DataFrame()
+    # --- Tarih aralığı uygula (range beklenir) ---
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start_date = pd.Timestamp(date_range[0], tz="UTC")
+        end_date = pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)  # bitiş gününü dahil et
     else:
-        df_5m, df_1h, df_1d = df_5m_all, df_1h_all, df_1d_all
+        # herhangi bir sebeple tek tarih gelirse fallback
+        start_date = pd.Timestamp(date_range, tz="UTC")
+        end_date = start_date + pd.Timedelta(days=1)
+
+    df_5m = df_5m_all.loc[(df_5m_all.index >= start_date) & (df_5m_all.index < end_date)].copy()
+    df_1h = df_1h_all.loc[(df_1h_all.index >= start_date) & (df_1h_all.index < end_date)].copy()
+    df_1d = df_1d_all.loc[(df_1d_all.index >= start_date) & (df_1d_all.index < end_date)].copy() if has_1d else pd.DataFrame()
 
     # --- Bar yeterliliği kontrolleri ---
     if len(df_5m) < 40:
@@ -507,7 +494,6 @@ if run_btn:
         fig_eq.update_layout(height=350, xaxis_title="Time (UTC)", yaxis_title="Equity (USDT)")
         st.plotly_chart(fig_eq, use_container_width=True)
 
-        # Equity CSV indir
         csv_buf_eq = io.StringIO()
         eq.reset_index().rename(columns={"index":"time"}).to_csv(csv_buf_eq, index=False)
         st.download_button(
@@ -525,12 +511,10 @@ if run_btn:
             low=df_5m["low"], close=df_5m["close"], name="Price (5m)"
         )])
 
-        # Çizimde yoğunluğu azalt: yalnızca son N trade
+        # görsel yoğunluk için son N trade
         trades_to_plot = trades.tail(int(plot_n_trades)) if not trades.empty else trades
 
-        # Giriş/çıkış noktaları (yön renkleri)
         if not trades_to_plot.empty:
-            # Long ve Short girişleri ayır
             long_entries = trades_to_plot[trades_to_plot["side"]=="long"][["time","entry"]].dropna()
             short_entries = trades_to_plot[trades_to_plot["side"]=="short"][["time","entry"]].dropna()
 
@@ -547,7 +531,6 @@ if run_btn:
                     marker=dict(symbol="triangle-down", size=9, color="red")
                 ))
 
-            # Çıkışlar (renk: kazanç/zarar)
             if "exit_time" in trades_to_plot.columns:
                 exits = trades_to_plot.dropna(subset=["exit_time","exit","net"])
                 if not exits.empty:
@@ -568,14 +551,11 @@ if run_btn:
 
             # TP/SL seviyeleri (opsiyonel)
             if draw_tp_sl:
-                # çok çizgi olmasın diye yine son N trade üzerinden
                 for _, tr in trades_to_plot.iterrows():
                     x0 = tr["time"]
                     x1 = tr.get("exit_time", x0)
                     if pd.isna(x1):
-                        # kapanmadıysa görsel için az ileri taşıyalım
                         x1 = x0 + pd.Timedelta(minutes=30)
-                    # TP
                     if "tp" in tr and not pd.isna(tr["tp"]):
                         fig.add_trace(go.Scatter(
                             x=[x0, x1], y=[tr["tp"], tr["tp"]],
@@ -583,7 +563,6 @@ if run_btn:
                             line=dict(dash="dot", width=1, color="green"),
                             showlegend=False
                         ))
-                    # SL
                     if "sl" in tr and not pd.isna(tr["sl"]):
                         fig.add_trace(go.Scatter(
                             x=[x0, x1], y=[tr["sl"], tr["sl"]],
