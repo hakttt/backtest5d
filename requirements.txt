@@ -4,3 +4,4 @@ numpy==1.26.4
 requests==2.32.3
 fastparquet==2024.5.0
 plotly==5.22.0
+# force rebuild
