@@ -6,7 +6,7 @@
 #   numpy==1.26.4
 #   requests==2.32.3
 #   fastparquet==2024.5.0
-#   plotly==5.22.0
+# (Plotly artık kullanılmıyor)
 
 import os
 import io
@@ -18,7 +18,6 @@ import streamlit as st
 import tempfile
 from typing import Tuple
 from datetime import date
-import plotly.graph_objects as go
 
 st.set_page_config(page_title="BTC/ETH Futures Backtest (Dropbox Parquet)", layout="wide")
 
@@ -47,14 +46,19 @@ def stream_download(url: str, dst_path: str, chunk=1024*1024, timeout=180):
                 if part:
                     f.write(part)
 
-def ensure_local_copy(name: str, url: str) -> str:
+def ensure_local_copy(name: str, url: str, force: bool=False) -> str:
     """
-    URL değiştiğinde eski cache kullanılmasın diye URL hash'ini dosya adına ekler.
+    URL hash'ini dosya adına ekler; force=True ise mevcut dosyayı silip yeniden indirir.
     """
     base, ext = os.path.splitext(name)
     url_hash = hashlib.md5(url.encode()).hexdigest()[:10]
     local_name = f"{base}_{url_hash}{ext or '.parquet'}"
     local_path = os.path.join(DATA_DIR, local_name)
+    if force and os.path.exists(local_path):
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
     if not os.path.exists(local_path):
         direct = to_direct_link(url)
         stream_download(direct, local_path)
@@ -185,29 +189,38 @@ def make_signals_5m_with_1h_and_lrc(
     out["short_signal"] = short_raw.fillna(False)
     return out
 
-# ---------- Swing yardımcıları ----------
-def _last_swing_low(high: pd.Series, low: pd.Series, lookback: int = 10) -> float:
-    end = len(low) - 1
+# ---------- Swing yardımcıları (gelecek görmeden) ----------
+def _last_swing_low_upto(high: pd.Series, low: pd.Series, end_i: int, lookback: int = 10) -> float:
+    """
+    end_i: dahil DEĞİL (i-1'e kadarki veride ara)
+    """
+    if end_i <= 2:
+        return float(low.iloc[:end_i].min())
+    lo = low.iloc[:end_i]
+    hi = high.iloc[:end_i]
+    end = len(lo) - 1
     start = max(2, end - lookback)
     for i in range(end - 1, start - 1, -1):
         if i-1 >= 0 and i+1 <= end:
-            if (low.iloc[i] < low.iloc[i-1]) and (low.iloc[i] < low.iloc[i+1]):
-                return float(low.iloc[i])
-    return float(low.iloc[start:end].min()) if end > start else float(low.iloc[end])
+            if (lo.iloc[i] < lo.iloc[i-1]) and (lo.iloc[i] < lo.iloc[i+1]):
+                return float(lo.iloc[i])
+    return float(lo.iloc[start:end].min()) if end > start else float(lo.iloc[end])
 
-def _last_swing_high(high: pd.Series, low: pd.Series, lookback: int = 10) -> float:
-    end = len(high) - 1
+def _last_swing_high_upto(high: pd.Series, low: pd.Series, end_i: int, lookback: int = 10) -> float:
+    if end_i <= 2:
+        return float(high.iloc[:end_i].max())
+    lo = low.iloc[:end_i]
+    hi = high.iloc[:end_i]
+    end = len(hi) - 1
     start = max(2, end - lookback)
     for i in range(end - 1, start - 1, -1):
         if i-1 >= 0 and i+1 <= end:
-            if (high.iloc[i] > high.iloc[i-1]) and (high.iloc[i] > high.iloc[i+1]):
-                return float(high.iloc[i])
-    return float(high.iloc[start:end].max()) if end > start else float(high.iloc[end])
+            if (hi.iloc[i] > hi.iloc[i-1]) and (hi.iloc[i] > hi.iloc[i+1]):
+                return float(hi.iloc[i])
+    return float(hi.iloc[start:end].max()) if end > start else float(hi.iloc[end])
 
-# ---------- Backtest (TP daima 2×SL) ----------
+# ---------- Backtest (Oto-stop: max(2×ATR_prev, swing)) ----------
 def backtest(df: pd.DataFrame,
-             stop_type: str = "Swing",     # "Swing" | "ATR"
-             atr_stop_mult: float = 2.0,
              entry_offset_bps: float = 0.0,
              fee_rate: float = 0.0004,
              initial_equity: float = 1000.0,
@@ -233,6 +246,8 @@ def backtest(df: pd.DataFrame,
     eq_curve = []
 
     off_mult = 1.0 + (entry_offset_bps / 10000.0)
+    RR_TARGET = 2.0
+    RR_TOL = 1e-6  # float toleransı
 
     def cap_by_leverage(q: float, price: float) -> Tuple[float, float]:
         nominal_ = q * price
@@ -242,9 +257,6 @@ def backtest(df: pd.DataFrame,
             q *= scale
             nominal_ = max_nominal
         return q, nominal_
-
-    RR_TARGET = 2.0
-    RR_TOL = 1e-6  # float toleransı
 
     for i in range(2, len(df)):
         ts = df.index[i]
@@ -257,50 +269,52 @@ def backtest(df: pd.DataFrame,
                 ent = float(o.iloc[i])
                 ent = ent * off_mult if signal_long else ent / off_mult
 
-                # SL hesapla ve mesafeyi bul
-                if signal_long:
-                    if stop_type == "Swing":
-                        s_low = _last_swing_low(h, l, lookback=swing_lookback)
-                        sl = max(0.0, float(s_low - pip_size))
-                    else:
-                        sl = float(ent - atrv.iloc[i] * atr_stop_mult)
-                    dist = max(ent - sl, 0.0)
-                else:
-                    if stop_type == "Swing":
-                        s_high = _last_swing_high(h, l, lookback=swing_lookback)
-                        sl = float(s_high + pip_size)
-                    else:
-                        sl = float(ent + atrv.iloc[i] * atr_stop_mult)
-                    dist = max(sl - ent, 0.0)
+                atr_prev = float(atrv.iloc[i-1]) if np.isfinite(atrv.iloc[i-1]) else np.nan
 
-                if dist <= 0 or not np.isfinite(dist):
-                    eq_curve.append((ts, equity))
-                    continue
+                if signal_long:
+                    s_low = _last_swing_low_upto(h, l, end_i=i, lookback=swing_lookback)
+                    swing_stop = max(0.0, float(s_low - pip_size))
+                    dist_swing = max(ent - swing_stop, 0.0)
+
+                    dist_atr = max(2.0 * atr_prev, 0.0) if np.isfinite(atr_prev) else 0.0
+                    dist = max(dist_swing, dist_atr)
+                    if dist <= 0: 
+                        eq_curve.append((ts, equity)); continue
+
+                    sl = float(ent - dist)
+                    tp = float(ent + RR_TARGET * dist)
+                    side = "long"
+                    sl_dist = dist
+                    tp_dist = RR_TARGET * dist
+
+                else:
+                    s_high = _last_swing_high_upto(h, l, end_i=i, lookback=swing_lookback)
+                    swing_stop = float(s_high + pip_size)
+                    dist_swing = max(swing_stop - ent, 0.0)
+
+                    dist_atr = max(2.0 * atr_prev, 0.0) if np.isfinite(atr_prev) else 0.0
+                    dist = max(dist_swing, dist_atr)
+                    if dist <= 0: 
+                        eq_curve.append((ts, equity)); continue
+
+                    sl = float(ent + dist)
+                    tp = float(ent - RR_TARGET * dist)
+                    side = "short"
+                    sl_dist = dist
+                    tp_dist = RR_TARGET * dist
 
                 # Pozisyon boyutu — risk % SL zararına göre
                 if risk_mode == "fixed":
                     q = max(fixed_amount / ent, 0.0)
                 else:
                     risk_amount = max(equity * risk_pct, 0.0)
-                    q = max(risk_amount / dist, 0.0)
+                    q = max(risk_amount / sl_dist, 0.0)
 
                 # Leverage sınırı
                 q, nominal = cap_by_leverage(q, ent)
                 if q <= 0:
                     eq_curve.append((ts, equity))
                     continue
-
-                # TP = 2×SL ve rr kontrol
-                if signal_long:
-                    tp = float(ent + RR_TARGET * dist)
-                    side = "long"
-                    tp_dist = tp - ent
-                    sl_dist = ent - sl
-                else:
-                    tp = float(ent - RR_TARGET * dist)
-                    side = "short"
-                    tp_dist = ent - tp
-                    sl_dist = sl - ent
 
                 rr_eff = (tp_dist / sl_dist) if sl_dist > 0 else np.nan
                 if not np.isfinite(rr_eff) or abs(rr_eff - RR_TARGET) > RR_TOL:
@@ -336,12 +350,12 @@ def backtest(df: pd.DataFrame,
                 fee_close = qty * float(exit_price) * fee_rate
                 pnl = (exit_price - entry_price) * qty if side == "long" else (entry_price - exit_price) * qty
                 net = pnl - (trades[-1]["fee_open"] + fee_close)
-                equity += net
                 trades[-1].update({
                     "exit_time": ts, "exit": float(exit_price),
                     "result": result, "pnl": float(pnl), "net": float(net),
-                    "fee_close": float(fee_close), "equity_after": float(equity)
+                    "fee_close": float(fee_close)
                 })
+                equity += net
                 in_pos = False; side = None; entry_price = sl = tp = np.nan
 
         eq_curve.append((ts, equity))
@@ -366,14 +380,14 @@ def backtest(df: pd.DataFrame,
         closed = wins + losses
         winrate = (100.0 * wins / closed) if closed > 0 else 0.0
 
-        net_total = float(trades_df["net"].sum(skipna=True))
+        net_total = float(trades_df["net"].sum(skipna=True)) if "net" in trades_df else 0.0
         eq = eq_df["equity"].fillna(method="ffill").fillna(initial_equity)
         peak = eq.cummax()
         dd = (eq - peak) / peak
         max_dd = float(dd.min() * 100.0)
         final_eq = float(eq.iloc[-1])
 
-        # Streak'ler de "TP" bazlı
+        # Streak'ler "TP" bazlı
         win_flags = tp_mask.reindex(trades_df.index, fill_value=False)
         max_w = max_l = cur_w = cur_l = 0
         for v in win_flags.astype(bool).tolist():
@@ -401,6 +415,7 @@ st.title("BTC/ETH • Futures Backtest (Dropbox Parquet)")
 with st.sidebar:
     st.subheader("Veri Kaynağı (Futures)")
     fut_url = st.text_input("Futures URL", value=DEFAULT_FUTURES_URL)
+    force_dl = st.checkbox("Önbelleği yok say ve yeniden indir", value=False)
 
     st.subheader("Seçimler")
     wanted_symbol = st.selectbox("Sembol", ["BTCUSDT","ETHUSDT"], index=0)
@@ -414,20 +429,8 @@ with st.sidebar:
     st.subheader("Opsiyonel LRC Filtre")
     use_lrc = st.checkbox("LRC filtresi (1D LRC-300)", value=False)
 
-    st.subheader("Grafik Ayarı")
-    show_graphs = st.checkbox("Grafikleri göster", value=False)
-    show_ema = st.checkbox("Grafikte EMA(7/13/26) çizgilerini göster", value=False)
-    show_lrc_overlay = st.checkbox("Grafikte 1D LRC(300) bandını göster", value=False)
-    draw_tp_sl = st.checkbox("İşlemlerde TP/SL seviyelerini çiz", value=False)
-    plot_n_trades = st.number_input("Son N trade çiz (görsel)", min_value=10, max_value=2000, value=300, step=10)
-
-    st.subheader("Stop / Hedef Ayarları")
-    stop_type = st.selectbox("Stop Tipi", ["Swing","ATR"], index=0)
-    atr_mult = st.number_input("SL = ATR × [ATR için]", 0.5, 10.0, 2.0, 0.1)
+    st.subheader("İşlem / Risk Ayarları")
     entry_off = st.number_input("Giriş Offset (bps)", 0.0, 100.0, 0.0, 1.0)
-    st.caption("Not: TP her zaman SL mesafesinin **2×**'sidir.")
-
-    st.subheader("Sermaye / İşlem")
     init_eq = st.number_input("Başlangıç Sermaye", 100.0, 1_000_000.0, 1000.0, 100.0)
     lev = st.number_input("Kaldıraç (x)", 1.0, 100.0, 10.0, 1.0)
     fee = st.number_input("Komisyon (her bacak)", 0.0, 0.005, 0.0004, 0.0001, format="%.4f")
@@ -456,7 +459,7 @@ if "last_stats_text" in st.session_state:
 # ---------- Ana akış ----------
 if run_btn:
     try:
-        local_path = ensure_local_copy("futures_btc_eth.parquet", fut_url)
+        local_path = ensure_local_copy("futures_btc_eth.parquet", fut_url, force=force_dl)
         big = load_parquet(local_path)
     except Exception as e:
         st.error(f"Veri yükleme hatası: {e}")
@@ -519,11 +522,9 @@ if run_btn:
         use_lrc=use_lrc
     )
 
-    # --- Backtest (TP = 2×SL) ---
+    # --- Backtest (Oto-stop, TP=2×SL) ---
     trades, stats, eq = backtest(
         sig,
-        stop_type=stop_type,
-        atr_stop_mult=atr_mult,
         entry_offset_bps=entry_off,
         fee_rate=fee,
         initial_equity=init_eq,
@@ -535,30 +536,21 @@ if run_btn:
         pip_size=0.01
     )
 
-    # ---- Sonuçlar ----
-    c1, c2 = st.columns([2,1])
-    with c1:
-        st.subheader("Equity Eğrisi (Streamlit)")
-        if show_graphs:
-            st.line_chart(eq)
-        else:
-            st.caption("Grafikler kapalı (sidebar → Grafikleri göster).")
-    with c2:
-        st.subheader("Özet")
-        summary = {
-            "Toplam İşlem": stats.get("trades", 0),
-            "Kazanan": stats.get("wins", 0),              # TP sayısı
-            "Kaybeden": stats.get("losses", 0),           # SL + SL_first sayısı
-            "Winrate %": round(stats.get("winrate", 0.0), 2),
-            "Max Consec Wins": stats.get("max_consec_wins", 0),
-            "Max Consec Losses": stats.get("max_consec_losses", 0),
-            "Net Toplam (USDT)": round(stats.get("net_total", 0.0), 2),
-            "Final Equity": round(stats.get("final_equity", 0.0), 2),
-            "Max Drawdown %": round(stats.get("max_dd", 0.0), 2),
-        }
-        st.write(summary)
+    # ---- Özet & CSV ----
+    st.subheader("Özet")
+    summary = {
+        "Toplam İşlem": stats.get("trades", 0),
+        "Kazanan": stats.get("wins", 0),              # TP sayısı
+        "Kaybeden": stats.get("losses", 0),           # SL + SL_first sayısı
+        "Winrate %": round(stats.get("winrate", 0.0), 2),
+        "Max Consec Wins": stats.get("max_consec_wins", 0),
+        "Max Consec Losses": stats.get("max_consec_losses", 0),
+        "Net Toplam (USDT)": round(stats.get("net_total", 0.0), 2),
+        "Final Equity": round(stats.get("final_equity", 0.0), 2),
+        "Max Drawdown %": round(stats.get("max_dd", 0.0), 2),
+    }
+    st.write(summary)
 
-    # ---- Sonuçları kopyalanabilir şekilde kilitle ----
     stats_text = (
         f"Toplam İşlem: {summary['Toplam İşlem']}\n"
         f"Kazanan (TP): {summary['Kazanan']}  |  Kaybeden (SL): {summary['Kaybeden']}\n"
@@ -575,81 +567,6 @@ if run_btn:
     st.session_state["last_trades_csv"] = csv_buf.getvalue()
     st.session_state["last_trades_name"] = f"trades_{wanted_symbol}_futures.csv"
 
-    # ---- Plotly grafikler (isteğe bağlı) ----
-    if show_graphs:
-        st.subheader("Equity Eğrisi (Plotly)")
-        if not eq.empty:
-            fig_eq = go.Figure()
-            fig_eq.add_trace(go.Scatter(x=eq.index, y=eq["equity"], mode="lines", name="Equity"))
-            fig_eq.update_layout(height=350, xaxis_title="Time (UTC)", yaxis_title="Equity (USDT)")
-            st.plotly_chart(fig_eq, use_container_width=True)
-
-        st.subheader("Fiyat Grafiği (5m) – Giriş/Çıkış Noktaları")
-        if not df_5m.empty:
-            fig = go.Figure(data=[go.Candlestick(
-                x=df_5m.index, open=df_5m["open"], high=df_5m["high"],
-                low=df_5m["low"], close=df_5m["close"], name="Price (5m)"
-            )])
-
-            trades_to_plot = trades.tail(int(plot_n_trades)) if not trades.empty else trades
-            if not trades_to_plot.empty:
-                long_entries = trades_to_plot[trades_to_plot["side"]=="long"][["time","entry"]].dropna()
-                short_entries = trades_to_plot[trades_to_plot["side"]=="short"][["time","entry"]].dropna()
-                if not long_entries.empty:
-                    fig.add_trace(go.Scatter(
-                        x=long_entries["time"], y=long_entries["entry"],
-                        mode="markers", name="Long Entry",
-                        marker=dict(symbol="triangle-up", size=9, color="green")
-                    ))
-                if not short_entries.empty:
-                    fig.add_trace(go.Scatter(
-                        x=short_entries["time"], y=short_entries["entry"],
-                        mode="markers", name="Short Entry",
-                        marker=dict(symbol="triangle-down", size=9, color="red")
-                    ))
-                if "exit_time" in trades_to_plot.columns:
-                    exits = trades_to_plot.dropna(subset=["exit_time","exit","net"])
-                    if not exits.empty:
-                        win_exits = exits[exits["net"] > 0]
-                        loss_exits = exits[exits["net"] <= 0]
-                        if not win_exits.empty:
-                            fig.add_trace(go.Scatter(
-                                x=win_exits["exit_time"], y=win_exits["exit"],
-                                mode="markers", name="Exit (Win)",
-                                marker=dict(symbol="x", size=9, color="green")
-                            ))
-                        if not loss_exits.empty:
-                            fig.add_trace(go.Scatter(
-                                x=loss_exits["exit_time"], y=loss_exits["exit"],
-                                mode="markers", name="Exit (Loss)",
-                                marker=dict(symbol="x", size=9, color="red")
-                            ))
-                if draw_tp_sl and not trades_to_plot.empty:
-                    for _, tr in trades_to_plot.iterrows():
-                        x0 = tr["time"]; x1 = tr.get("exit_time", x0 + pd.Timedelta(minutes=30))
-                        if "tp" in tr and not pd.isna(tr["tp"]):
-                            fig.add_trace(go.Scatter(x=[x0, x1], y=[tr["tp"], tr["tp"]],
-                                                     mode="lines", line=dict(dash="dot", width=1, color="green"),
-                                                     showlegend=False))
-                        if "sl" in tr and not pd.isna(tr["sl"]):
-                            fig.add_trace(go.Scatter(x=[x0, x1], y=[tr["sl"], tr["sl"]],
-                                                     mode="lines", line=dict(dash="dot", width=1, color="red"),
-                                                     showlegend=False))
-            if show_ema and {"ema_f","ema_m","ema_s"}.issubset(sig.columns):
-                fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_f"], mode="lines", name="EMA 7"))
-                fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_m"], mode="lines", name="EMA 13"))
-                fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_s"], mode="lines", name="EMA 26"))
-            if show_lrc_overlay and not daily_ext.empty:
-                bands = cached_lrc_bands(daily_ext, length=300)
-                if not bands.empty:
-                    lrc_high = bands["lrc_high"].reindex(df_5m.index, method="ffill")
-                    lrc_low  = bands["lrc_low"].reindex(df_5m.index, method="ffill")
-                    fig.add_trace(go.Scatter(x=df_5m.index, y=lrc_high, mode="lines", name="LRC High (1D→5m)"))
-                    fig.add_trace(go.Scatter(x=df_5m.index, y=lrc_low,  mode="lines", name="LRC Low  (1D→5m)"))
-            fig.update_layout(height=560, xaxis_title="Time (UTC)", yaxis_title="Price")
-            st.plotly_chart(fig, use_container_width=True)
-
-    # ---- İşlemler + CSV (her durumda) ----
     st.subheader("İşlemler")
     if not trades.empty:
         st.dataframe(trades.tail(200), use_container_width=True)
