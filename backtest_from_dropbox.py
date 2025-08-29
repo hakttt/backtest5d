@@ -248,13 +248,16 @@ def backtest(df: pd.DataFrame,
     off_mult = 1.0 + (entry_offset_bps / 10000.0)
 
     def cap_by_leverage(q: float, price: float) -> Tuple[float, float]:
-        nominal = q * price
+        nominal_ = q * price
         max_nominal = max(equity * leverage, 0.0)
-        if nominal > max_nominal > 0.0:
-            scale = max_nominal / nominal
+        if nominal_ > max_nominal > 0.0:
+            scale = max_nominal / nominal_
             q *= scale
-            nominal = max_nominal
-        return q, nominal
+            nominal_ = max_nominal
+        return q, nominal_
+
+    RR_TARGET = 2.0
+    RR_TOL = 1e-6  # float toleransı
 
     for i in range(2, len(df)):
         ts = df.index[i]
@@ -267,7 +270,7 @@ def backtest(df: pd.DataFrame,
                 ent = float(o.iloc[i])
                 ent = ent * off_mult if signal_long else ent / off_mult
 
-                # SL hesapla
+                # SL hesapla ve mesafeyi bul
                 if signal_long:
                     if stop_type == "Swing":
                         s_low = _last_swing_low(h, l, lookback=swing_lookback)
@@ -300,21 +303,32 @@ def backtest(df: pd.DataFrame,
                     eq_curve.append((ts, equity))
                     continue
 
-                # TP = 2×SL
+                # TP = 2×SL ve rr kontrol
                 if signal_long:
-                    tp = float(ent + 2.0 * dist)
+                    tp = float(ent + RR_TARGET * dist)
                     side = "long"
+                    tp_dist = tp - ent
+                    sl_dist = ent - sl
                 else:
-                    tp = float(ent - 2.0 * dist)
+                    tp = float(ent - RR_TARGET * dist)
                     side = "short"
+                    tp_dist = ent - tp
+                    sl_dist = sl - ent
 
-                fee_open = nominal * fee_rate
+                rr_eff = (tp_dist / sl_dist) if sl_dist > 0 else np.nan
+                if not np.isfinite(rr_eff) or abs(rr_eff - RR_TARGET) > RR_TOL:
+                    # Herhangi bir nedenle rr 2 değilse trade’i açma
+                    eq_curve.append((ts, equity))
+                    continue
+
+                fee_open = q * ent * fee_rate
                 entry_price = float(ent)
                 in_pos = True
 
                 trades.append({
                     "time": ts, "side": side, "entry": entry_price,
                     "sl": float(sl), "tp": float(tp),
+                    "sl_dist": float(sl_dist), "tp_dist": float(tp_dist), "rr": float(rr_eff),
                     "qty": float(q), "nominal": float(nominal),
                     "fee_open": float(fee_open)
                 })
@@ -333,7 +347,7 @@ def backtest(df: pd.DataFrame,
                 result = "SL"; exit_price = sl
 
             if exit_price is not None:
-                fee_close = nominal * fee_rate
+                fee_close = qty * float(exit_price) * fee_rate
                 pnl = (exit_price - entry_price) * qty if side == "long" else (entry_price - exit_price) * qty
                 net = pnl - (trades[-1]["fee_open"] + fee_close)
                 equity += net
@@ -349,6 +363,7 @@ def backtest(df: pd.DataFrame,
     trades_df = pd.DataFrame(trades)
     eq_df = pd.DataFrame(eq_curve, columns=["time", "equity"]).set_index("time")
 
+    # ---- İstatistikler (TP/SL bazlı kazanım) ----
     if trades_df.empty:
         stats = {
             "trades": 0, "wins": 0, "losses": 0,
@@ -357,21 +372,30 @@ def backtest(df: pd.DataFrame,
             "max_consec_wins": 0, "max_consec_losses": 0
         }
     else:
-        wins = int((trades_df["net"] > 0).sum())
-        losses = int((trades_df["net"] <= 0).sum())
-        net_total = float(trades_df["net"].sum())
+        res_str = trades_df["result"].astype(str).str.upper()
+        tp_mask = res_str == "TP"
+        sl_mask = res_str.isin(["SL", "SL_FIRST"])
+        wins = int(tp_mask.sum())
+        losses = int(sl_mask.sum())
+        closed = wins + losses
+        winrate = (100.0 * wins / closed) if closed > 0 else 0.0
+
+        net_total = float(trades_df["net"].sum(skipna=True))
         eq = eq_df["equity"].fillna(method="ffill").fillna(initial_equity)
         peak = eq.cummax()
         dd = (eq - peak) / peak
         max_dd = float(dd.min() * 100.0)
-        winrate = 100.0 * wins / len(trades_df)
-        win_flags = trades_df["net"] > 0
+        final_eq = float(eq.iloc[-1])
+
+        # Streak'ler de "TP" bazlı
+        win_flags = tp_mask.reindex(trades_df.index, fill_value=False)
         max_w = max_l = cur_w = cur_l = 0
         for v in win_flags.astype(bool).tolist():
             if v:
                 cur_w += 1; max_w = max(max_w, cur_w); cur_l = 0
             else:
                 cur_l += 1; max_l = max(max_l, cur_l); cur_w = 0
+
         stats = {
             "trades": int(len(trades_df)),
             "wins": wins,
@@ -379,7 +403,7 @@ def backtest(df: pd.DataFrame,
             "winrate": float(winrate),
             "net_total": net_total,
             "max_dd": max_dd,
-            "final_equity": float(eq.iloc[-1]),
+            "final_equity": final_eq,
             "max_consec_wins": int(max_w),
             "max_consec_losses": int(max_l)
         }
@@ -401,7 +425,6 @@ with st.sidebar:
     st.subheader("Tarih Aralığı")
     default_range = (date(2020, 1, 1), date.today())
     date_range = st.date_input("İşlem aralığı (UTC)", value=default_range, help="Başlangıç ve bitiş tarihi seçiniz")
-    # --- İSTENEN NOT ---
     st.caption("Btc/Eth (2019-12.ay/2025 7. ay arası) 5m 1h 1d 1w 1m futures.")
 
     st.subheader("Opsiyonel LRC Filtre")
@@ -530,8 +553,8 @@ if run_btn:
         st.subheader("Özet")
         summary = {
             "Toplam İşlem": stats.get("trades", 0),
-            "Kazanan": stats.get("wins", 0),
-            "Kaybeden": stats.get("losses", 0),
+            "Kazanan": stats.get("wins", 0),              # TP sayısı
+            "Kaybeden": stats.get("losses", 0),           # SL + SL_first sayısı
             "Winrate %": round(stats.get("winrate", 0.0), 2),
             "Max Consec Wins": stats.get("max_consec_wins", 0),
             "Max Consec Losses": stats.get("max_consec_losses", 0),
@@ -544,7 +567,7 @@ if run_btn:
     # ---- Sonuçları kopyalanabilir şekilde kilitle ----
     stats_text = (
         f"Toplam İşlem: {summary['Toplam İşlem']}\n"
-        f"Kazanan: {summary['Kazanan']}  |  Kaybeden: {summary['Kaybeden']}\n"
+        f"Kazanan (TP): {summary['Kazanan']}  |  Kaybeden (SL): {summary['Kaybeden']}\n"
         f"Winrate: {summary['Winrate %']}%\n"
         f"Max Consec Wins: {summary['Max Consec Wins']}  |  Max Consec Losses: {summary['Max Consec Losses']}\n"
         f"Net PnL (USDT): {summary['Net Toplam (USDT)']}\n"
