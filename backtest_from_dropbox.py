@@ -17,21 +17,16 @@ import pandas as pd
 import streamlit as st
 import tempfile
 from typing import Tuple
-from datetime import date, timedelta
+from datetime import date
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="BTC/ETH Backtest (Dropbox Parquet)", layout="wide")
 
-# ----- Varsayılan linkler -----
+# ----- Varsayılan FUTURES linki -----
 DEFAULT_FUTURES_URL = (
     "https://www.dropbox.com/scl/fi/58n3fd9syv91z1y2ro1d0/"
     "binance_futures_5m-1h-1w-1M-1d_2019-12_2025-07_BTC_ETH.parquet"
     "?rlkey=fls6fw8ewieqig77ufdhhh1s9&st=xn143hx8&dl=0"
-)
-DEFAULT_SPOT_URL = (
-    "https://www.dropbox.com/scl/fi/eavvv8z452i0b6x1c2a5r/"
-    "binance_spot_5m-1h-1w-1M_2020-01_2025-08_BTC_ETH.parquet"
-    "?rlkey=swsjkpbp22v4vj68ggzony8yw&st=2sww3kao&dl=0"
 )
 
 # ---- Yazılabilir cache dizini (/tmp) ----
@@ -121,14 +116,14 @@ def cached_lrc_bands(df_1d: pd.DataFrame, length: int = 300) -> pd.DataFrame:
     df_1d = df_1d.sort_index()
     df_1d = df_1d[~df_1d.index.duplicated(keep="last")]
     key = (str(df_1d.index.min()) + str(df_1d.index.max()) + str(float(df_1d["close"].sum())))
-    _ = hashlib.md5(key.encode()).hexdigest()
+    _ = hashlib.md5(key.encode()).hexdigest()  # cache param güvenlik
     return compute_lrc_bands(df_1d, length=length)
 
 # ---------- 5m + 1h EMA + Opsiyonel LRC ----------
 def make_signals_5m_with_1h_and_lrc(
     df_5m: pd.DataFrame,
     df_1h: pd.DataFrame,
-    df_1d_for_lrc: pd.DataFrame,   # yalnızca dataset'in 1D verisi
+    df_1d_for_lrc: pd.DataFrame,   # yalnız dataset 1D
     atr_len: int = 14,
     regime_filter: str | None = None,
     use_lrc: bool = False
@@ -203,23 +198,9 @@ def _last_swing_high(high: pd.Series, low: pd.Series, lookback: int = 10) -> flo
                 return float(high.iloc[i])
     return float(high.iloc[start:end].max()) if end > start else float(high.iloc[end])
 
-# ---------- Streak yardımcı ----------
-def _consecutive_streaks(win_flags: pd.Series) -> Tuple[int, int]:
-    max_w = max_l = cur_w = cur_l = 0
-    for v in win_flags.astype(bool).tolist():
-        if v:
-            cur_w += 1; max_w = max(max_w, cur_w)
-            cur_l = 0
-        else:
-            cur_l += 1; max_l = max(max_l, cur_l)
-            cur_w = 0
-    return max_w, max_l
-
 # ---------- Backtest (TP daima 2×SL) ----------
 def backtest(df: pd.DataFrame,
              stop_type: str = "Swing",     # "Swing" | "ATR"
-             tp_percent: float = 10.0,     # (KULLANILMIYOR)
-             rr: float = 2.0,              # (KULLANILMIYOR, sabit 2)
              atr_stop_mult: float = 2.0,
              entry_offset_bps: float = 0.0,
              fee_rate: float = 0.0004,
@@ -317,7 +298,6 @@ def backtest(df: pd.DataFrame,
 
                 rr_eff = (tp_dist / sl_dist) if sl_dist > 0 else np.nan
                 if not np.isfinite(rr_eff) or abs(rr_eff - RR_TARGET) > RR_TOL:
-                    # Herhangi bir nedenle rr 2 değilse trade’i açma
                     eq_curve.append((ts, equity))
                     continue
 
@@ -410,20 +390,18 @@ def backtest(df: pd.DataFrame,
     return trades_df, stats, eq_df
 
 # ---------- UI ----------
-st.title("BTC/ETH • Spot & Futures Backtest (Dropbox Parquet)")
+st.title("BTC/ETH • Futures Backtest (Dropbox Parquet)")
 
 with st.sidebar:
-    st.subheader("Veri Kaynağı")
-    dataset_choice = st.radio("Dataset", ["Futures","Spot"], index=0, horizontal=True)
+    st.subheader("Veri Kaynağı (Futures)")
     fut_url = st.text_input("Futures URL", value=DEFAULT_FUTURES_URL)
-    spot_url = st.text_input("Spot URL", value=DEFAULT_SPOT_URL)
 
     st.subheader("Seçimler")
     wanted_symbol = st.selectbox("Sembol", ["BTCUSDT","ETHUSDT"], index=0)
     regime = st.selectbox("Rejim filtresi", ["Hepsi","long-only","short-only"], index=0)
 
     st.subheader("Tarih Aralığı")
-    default_range = (date(2020, 1, 1), date.today())
+    default_range = (date(2020, 1, 1), date(2025, 7, 31))
     date_range = st.date_input("İşlem aralığı (UTC)", value=default_range, help="Başlangıç ve bitiş tarihi seçiniz")
     st.caption("Btc/Eth (2019-12.ay/2025 7. ay arası) 5m 1h 1d 1w 1m futures.")
 
@@ -471,10 +449,8 @@ if "last_stats_text" in st.session_state:
 
 # ---------- Ana akış ----------
 if run_btn:
-    use_url = fut_url if dataset_choice == "Futures" else spot_url
-    stub = "futures" if dataset_choice == "Futures" else "spot"
     try:
-        local_path = ensure_local_copy(f"{stub}_btc_eth.parquet", use_url)
+        local_path = ensure_local_copy("futures_btc_eth.parquet", fut_url)
         big = load_parquet(local_path)
     except Exception as e:
         st.error(f"Veri yükleme hatası: {e}")
@@ -496,15 +472,15 @@ if run_btn:
         if pd.Timestamp(a) > pd.Timestamp(b):
             a, b = b, a
         start_date = pd.Timestamp(a).tz_localize("UTC")
-        end_date = pd.Timestamp(b).tz_localize("UTC") + pd.Timedelta(days=1)
+        end_date = pd.Timestamp(b).tz_localize("UTC") + pd.Timedelta(days=1)  # bitiş dahil
     else:
         start_date = pd.Timestamp(date_range).tz_localize("UTC")
         end_date = start_date + pd.Timedelta(days=1)
 
-    # --- LRC için geçmiş pad'li 1D veriyi hazırla (YALNIZ dataset 1D) ---
+    # --- 1D LRC pad (yalnız dataset 1D) ---
     daily_full = df_1d_all.copy()
     if use_lrc and daily_full.empty:
-        st.warning("LRC aktif, ancak 1D veri bulunamadı; LRC uygulanmayacak (resample yok).")
+        st.warning("LRC aktif, ancak 1D veri bulunamadı; LRC uygulanmayacak.")
     start_ext = (start_date - pd.Timedelta(days=400)).floor("D")
     daily_ext = daily_full.loc[(daily_full.index >= start_ext) & (daily_full.index < end_date)].copy()
     daily_ext = daily_ext.sort_index()
@@ -515,6 +491,18 @@ if run_btn:
     df_1h = df_1h_all.loc[(df_1h_all.index >= start_date) & (df_1h_all.index < end_date)].copy().sort_index()
     df_5m = df_5m[~df_5m.index.duplicated(keep="last")]
     df_1h = df_1h[~df_1h.index.duplicated(keep="last")]
+
+    # --- Bilgi notu: kapsam ve bar sayısı ---
+    def _rng(df):
+        return (str(df.index.min()) if not df.empty else "—",
+                str(df.index.max()) if not df.empty else "—",
+                len(df))
+    m0, M0, n0 = _rng(df_5m_all); m1, M1, n1 = _rng(df_1h_all); mD, MD, nD = _rng(df_1d_all)
+    fm, fM, fn = _rng(df_5m); hm, hM, hn = _rng(df_1h); dm, dM, dn = _rng(daily_ext)
+    st.caption(
+        f"Yüklü kapsam — 5m:[{m0} → {M0}]({n0} bar), 1h:[{m1} → {M1}]({n1} bar), 1d:[{mD} → {MD}]({nD} bar)\n"
+        f"Filtrelenen — 5m:[{fm} → {fM}]({fn}), 1h:[{hm} → {hM}]({hn}), LRC-1d-pad:[{dm} → {dM}]({dn})"
+    )
 
     # --- Sinyaller ---
     regime_arg = None if regime == "Hepsi" else regime
@@ -579,7 +567,7 @@ if run_btn:
     csv_buf = io.StringIO()
     trades.to_csv(csv_buf, index=False)
     st.session_state["last_trades_csv"] = csv_buf.getvalue()
-    st.session_state["last_trades_name"] = f"trades_{wanted_symbol}_{dataset_choice}.csv"
+    st.session_state["last_trades_name"] = f"trades_{wanted_symbol}_futures.csv"
 
     # ---- Plotly grafikler (isteğe bağlı) ----
     if show_graphs:
