@@ -6,7 +6,6 @@
 #   numpy==1.26.4
 #   requests==2.32.3
 #   fastparquet==2024.5.0
-# (Plotly artık kullanılmıyor)
 
 import os
 import io
@@ -191,9 +190,6 @@ def make_signals_5m_with_1h_and_lrc(
 
 # ---------- Swing yardımcıları (gelecek görmeden) ----------
 def _last_swing_low_upto(high: pd.Series, low: pd.Series, end_i: int, lookback: int = 10) -> float:
-    """
-    end_i: dahil DEĞİL (i-1'e kadarki veride ara)
-    """
     if end_i <= 2:
         return float(low.iloc[:end_i].min())
     lo = low.iloc[:end_i]
@@ -219,14 +215,14 @@ def _last_swing_high_upto(high: pd.Series, low: pd.Series, end_i: int, lookback:
                 return float(hi.iloc[i])
     return float(hi.iloc[start:end].max()) if end > start else float(hi.iloc[end])
 
-# ---------- Backtest (Oto-stop: max(2×ATR_prev, swing)) ----------
+# ---------- Backtest (Oto-stop: max(2×ATR_prev, swing); TP=2×SL) ----------
 def backtest(df: pd.DataFrame,
              entry_offset_bps: float = 0.0,
              fee_rate: float = 0.0004,
              initial_equity: float = 1000.0,
-             risk_mode: str = "dynamic",   # "fixed" -> sabit notional
-             fixed_amount: float = 100.0,  # (USDT notional)
-             risk_pct: float = 0.02,       # dynamic: equity * risk_pct = SL zararı
+             risk_mode: str = "dynamic",
+             fixed_amount: float = 100.0,
+             risk_pct: float = 0.02,
              leverage: float = 10.0,
              swing_lookback: int = 10,
              pip_size: float = 0.01) -> Tuple[pd.DataFrame, dict, pd.DataFrame]:
@@ -247,7 +243,7 @@ def backtest(df: pd.DataFrame,
 
     off_mult = 1.0 + (entry_offset_bps / 10000.0)
     RR_TARGET = 2.0
-    RR_TOL = 1e-6  # float toleransı
+    RR_TOL = 1e-6
 
     def cap_by_leverage(q: float, price: float) -> Tuple[float, float]:
         nominal_ = q * price
@@ -275,12 +271,10 @@ def backtest(df: pd.DataFrame,
                     s_low = _last_swing_low_upto(h, l, end_i=i, lookback=swing_lookback)
                     swing_stop = max(0.0, float(s_low - pip_size))
                     dist_swing = max(ent - swing_stop, 0.0)
-
                     dist_atr = max(2.0 * atr_prev, 0.0) if np.isfinite(atr_prev) else 0.0
                     dist = max(dist_swing, dist_atr)
-                    if dist <= 0: 
+                    if dist <= 0:
                         eq_curve.append((ts, equity)); continue
-
                     sl = float(ent - dist)
                     tp = float(ent + RR_TARGET * dist)
                     side = "long"
@@ -291,26 +285,22 @@ def backtest(df: pd.DataFrame,
                     s_high = _last_swing_high_upto(h, l, end_i=i, lookback=swing_lookback)
                     swing_stop = float(s_high + pip_size)
                     dist_swing = max(swing_stop - ent, 0.0)
-
                     dist_atr = max(2.0 * atr_prev, 0.0) if np.isfinite(atr_prev) else 0.0
                     dist = max(dist_swing, dist_atr)
-                    if dist <= 0: 
+                    if dist <= 0:
                         eq_curve.append((ts, equity)); continue
-
                     sl = float(ent + dist)
                     tp = float(ent - RR_TARGET * dist)
                     side = "short"
                     sl_dist = dist
                     tp_dist = RR_TARGET * dist
 
-                # Pozisyon boyutu — risk % SL zararına göre
                 if risk_mode == "fixed":
                     q = max(fixed_amount / ent, 0.0)
                 else:
                     risk_amount = max(equity * risk_pct, 0.0)
                     q = max(risk_amount / sl_dist, 0.0)
 
-                # Leverage sınırı
                 q, nominal = cap_by_leverage(q, ent)
                 if q <= 0:
                     eq_curve.append((ts, equity))
@@ -363,7 +353,6 @@ def backtest(df: pd.DataFrame,
     trades_df = pd.DataFrame(trades)
     eq_df = pd.DataFrame(eq_curve, columns=["time", "equity"]).set_index("time")
 
-    # ---- İstatistikler (TP/SL bazlı kazanım) ----
     if trades_df.empty:
         stats = {
             "trades": 0, "wins": 0, "losses": 0,
@@ -387,7 +376,6 @@ def backtest(df: pd.DataFrame,
         max_dd = float(dd.min() * 100.0)
         final_eq = float(eq.iloc[-1])
 
-        # Streak'ler "TP" bazlı
         win_flags = tp_mask.reindex(trades_df.index, fill_value=False)
         max_w = max_l = cur_w = cur_l = 0
         for v in win_flags.astype(bool).tolist():
@@ -459,17 +447,62 @@ if "last_stats_text" in st.session_state:
 # ---------- Ana akış ----------
 if run_btn:
     try:
+        # İlk yükleme
         local_path = ensure_local_copy("futures_btc_eth.parquet", fut_url, force=force_dl)
         big = load_parquet(local_path)
     except Exception as e:
         st.error(f"Veri yükleme hatası: {e}")
         st.stop()
 
+    # İstenen bitiş tarihi
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        end_req = pd.Timestamp(max(date_range[0], date_range[1])).tz_localize("UTC") + pd.Timedelta(days=1)
+        start_req = pd.Timestamp(min(date_range[0], date_range[1])).tz_localize("UTC")
+    else:
+        start_req = pd.Timestamp(date_range).tz_localize("UTC")
+        end_req = start_req + pd.Timedelta(days=1)
+
+    # Kapsam kontrolü (5m/1h/1d)
+    def _max_end(df, tf):
+        sel = (df["timeframe"].str.lower()==tf)
+        return df.loc[sel, :].index.max() if sel.any() else pd.NaT
+
+    # Eğer istenen bitiş, dosya kapsamının ötesindeyse bir kez zorla yeniden indir
+    max_end_any = max(
+        [ts for ts in [
+            _max_end(big, "5m"),
+            _max_end(big, "1h"),
+            _max_end(big, "1d")
+        ] if pd.notna(ts)],
+        default=pd.NaT
+    )
+    if pd.notna(max_end_any) and end_req > (max_end_any + pd.Timedelta(hours=1)):
+        st.info("Seçilen aralık dosya kapsamını aşıyor görünüyor; önbellek kırılıp dosya yeniden indiriliyor…")
+        try:
+            local_path = ensure_local_copy("futures_btc_eth.parquet", fut_url, force=True)
+            big = load_parquet(local_path)
+            # yeniden ölç
+            max_end_any = max(
+                [ts for ts in [
+                    _max_end(big, "5m"),
+                    _max_end(big, "1h"),
+                    _max_end(big, "1d")
+                ] if pd.notna(ts)],
+                default=pd.NaT
+            )
+        except Exception as e:
+            st.warning(f"Yeniden indirme sırasında sorun: {e}")
+
     # --- Sembol/timeframe kırp ---
-    df_5m_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "5m")].copy()
-    df_1h_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "1h")].copy()
-    has_1d = any(tf.lower() == "1d" for tf in big["timeframe"].unique())
-    df_1d_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "1d")].copy() if has_1d else pd.DataFrame()
+    try:
+        wanted_symbol = wanted_symbol  # UI'dan geliyor
+        df_5m_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "5m")].copy()
+        df_1h_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "1h")].copy()
+        has_1d = any(tf.lower() == "1d" for tf in big["timeframe"].unique())
+        df_1d_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "1d")].copy() if has_1d else pd.DataFrame()
+    except Exception as e:
+        st.error(f"Veri filtreleme hatası: {e}")
+        st.stop()
 
     if df_5m_all.empty or df_1h_all.empty:
         st.error("5m veya 1h veri yok.")
@@ -512,6 +545,8 @@ if run_btn:
         f"Yüklü kapsam — 5m:[{m0} → {M0}]({n0} bar), 1h:[{m1} → {M1}]({n1} bar), 1d:[{mD} → {MD}]({nD} bar)\n"
         f"Filtrelenen — 5m:[{fm} → {fM}]({fn}), 1h:[{hm} → {hM}]({hn}), LRC-1d-pad:[{dm} → {dM}]({dn})"
     )
+    if pd.notna(max_end_any) and end_date > (max_end_any + pd.Timedelta(hours=1)):
+        st.warning(f"Uyarı: Dosya kapsamı {max_end_any} ile sınırlı görünüyor. Bağlantıyı doğrula veya yeniden yüklemeyi dene.")
 
     # --- Sinyaller ---
     regime_arg = None if regime == "Hepsi" else regime
@@ -522,7 +557,7 @@ if run_btn:
         use_lrc=use_lrc
     )
 
-    # --- Backtest (Oto-stop, TP=2×SL) ---
+    # --- Backtest ---
     trades, stats, eq = backtest(
         sig,
         entry_offset_bps=entry_off,
@@ -540,8 +575,8 @@ if run_btn:
     st.subheader("Özet")
     summary = {
         "Toplam İşlem": stats.get("trades", 0),
-        "Kazanan": stats.get("wins", 0),              # TP sayısı
-        "Kaybeden": stats.get("losses", 0),           # SL + SL_first sayısı
+        "Kazanan": stats.get("wins", 0),
+        "Kaybeden": stats.get("losses", 0),
         "Winrate %": round(stats.get("winrate", 0.0), 2),
         "Max Consec Wins": stats.get("max_consec_wins", 0),
         "Max Consec Losses": stats.get("max_consec_losses", 0),
