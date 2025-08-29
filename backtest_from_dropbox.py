@@ -1,6 +1,6 @@
 # backtest_from_dropbox.py
 # Çalıştır: streamlit run backtest_from_dropbox.py
-# Gerekli paketler (requirements.txt):
+# Gerekli paketler:
 #   streamlit==1.36.0
 #   pandas==2.2.2
 #   numpy==1.26.4
@@ -9,7 +9,6 @@
 #   plotly==5.22.0
 
 import os
-import time
 import io
 import hashlib
 import requests
@@ -18,7 +17,7 @@ import pandas as pd
 import streamlit as st
 import tempfile
 from typing import Tuple
-from datetime import date
+from datetime import date, timedelta
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="BTC/ETH Backtest (Dropbox Parquet)", layout="wide")
@@ -83,6 +82,16 @@ def load_parquet(local_path: str) -> pd.DataFrame:
     df["timeframe"] = df["timeframe"].astype(str)
     return df.sort_index()
 
+# ---------- EMA / ATR ----------
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False, min_periods=length).mean()
+
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
+    return tr.rolling(length, min_periods=length).mean()
+
 # ---------- LRC ----------
 def _lrc_last_point(values: np.ndarray) -> float:
     w = np.asarray(values, dtype=float).ravel()
@@ -101,8 +110,8 @@ def rolling_lrc(series: pd.Series, length: int = 300) -> pd.Series:
 
 def compute_lrc_bands(df: pd.DataFrame, length: int = 300) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
-    out['lrc_high'] = rolling_lrc(df['high'], length=length)
-    out['lrc_low']  = rolling_lrc(df['low'],  length=length)
+    out["lrc_high"] = rolling_lrc(df["high"], length=length)
+    out["lrc_low"]  = rolling_lrc(df["low"],  length=length)
     return out
 
 @st.cache_data(show_spinner=False)
@@ -111,44 +120,42 @@ def cached_lrc_bands(df_1d: pd.DataFrame, length: int = 300) -> pd.DataFrame:
         return pd.DataFrame(index=getattr(df_1d, "index", None))
     df_1d = df_1d.sort_index()
     df_1d = df_1d[~df_1d.index.duplicated(keep="last")]
-    key = (str(df_1d.index.min()) + str(df_1d.index.max()) +
-           str(float(df_1d["close"].sum())))
+    key = (str(df_1d.index.min()) + str(df_1d.index.max()) + str(float(df_1d["close"].sum())))
     _ = hashlib.md5(key.encode()).hexdigest()
     return compute_lrc_bands(df_1d, length=length)
 
-# ---------- EMA / ATR ----------
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False, min_periods=length).mean()
-
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
-    return tr.rolling(length, min_periods=length).mean()
+def resample_1h_to_1d(df_1h: pd.DataFrame) -> pd.DataFrame:
+    # OHLC günlük resample
+    g = df_1h.resample("1D", origin="start_day").agg(
+        open=("open","first"),
+        high=("high","max"),
+        low=("low","min"),
+        close=("close","last")
+    ).dropna()
+    return g
 
 # ---------- 5m + 1h EMA + Opsiyonel LRC ----------
-def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
-                                    atr_len=14, regime_filter=None,
-                                    use_lrc=False, allow_long=True, allow_short=True):
+def make_signals_5m_with_1h_and_lrc(
+    df_5m: pd.DataFrame,
+    df_1h: pd.DataFrame,
+    df_1d_for_lrc: pd.DataFrame,   # pad'lenmiş 1D (ya gerçek 1D, ya 1h→1D)
+    atr_len: int = 14,
+    regime_filter: str | None = None,
+    use_lrc: bool = False
+) -> pd.DataFrame:
     """
     5m: EMA(7)>EMA(13)>EMA(26) => long ; EMA(7)<EMA(13)<EMA(26) => short
-    1h: yön teyidi (EMA7 vs EMA13) — 5m zamanına forward-fill
-    LRC (1D, opsiyonel): close>lrc_high -> sadece long; close<lrc_low -> sadece short
+    1h: yön teyidi (EMA7 vs EMA13) — 5m zamanına ffill
+    LRC (1D, opsiyonel): close>lrc_high -> sadece long; close<lrc_low -> sadece short; aradaysa sinyal yok
     """
     ema_fast, ema_mid, ema_slow = 7, 13, 26
 
-    # indeksleri temizle
     out = df_5m.copy().sort_index()
     out = out[~out.index.duplicated(keep="last")]
 
     h = df_1h.copy().sort_index()
     h = h[~h.index.duplicated(keep="last")]
 
-    d1 = df_1d.copy().sort_index() if df_1d is not None and not df_1d.empty else df_1d
-    if d1 is not None and not d1.empty:
-        d1 = d1[~d1.index.duplicated(keep="last")]
-
-    # EMA'lar
     out["ema_f"] = ema(out["close"], ema_fast)
     out["ema_m"] = ema(out["close"], ema_mid)
     out["ema_s"] = ema(out["close"], ema_slow)
@@ -161,21 +168,21 @@ def make_signals_5m_with_1h_and_lrc(df_5m, df_1h, df_1d,
     bull_5m = (out["ema_f"] > out["ema_m"]) & (out["ema_m"] > out["ema_s"])
     bear_5m = (out["ema_f"] < out["ema_m"]) & (out["ema_m"] < out["ema_s"])
 
-    # --- DÜZELTME: 1h -> 5m tek adım reindex (ffill), çift reindex kaldırıldı ---
     bull_1h_on_5m = h["bull_align_h"].reindex(out.index, method="ffill")
     bear_1h_on_5m = h["bear_align_h"].reindex(out.index, method="ffill")
 
     long_raw  = bull_5m & bull_1h_on_5m
     short_raw = bear_5m & bear_1h_on_5m
 
-    if use_lrc and d1 is not None and not d1.empty:
-        bands = cached_lrc_bands(d1, length=300)
-        lrc_high = bands['lrc_high'].reindex(out.index, method='ffill')
-        lrc_low  = bands['lrc_low'].reindex(out.index, method='ffill')
-        above = out["close"] > lrc_high
-        below = out["close"] < lrc_low
-        long_raw  = long_raw  & above & bool(allow_long)
-        short_raw = short_raw & below & bool(allow_short)
+    if use_lrc and df_1d_for_lrc is not None and not df_1d_for_lrc.empty:
+        bands = cached_lrc_bands(df_1d_for_lrc, length=300)
+        if not bands.empty:
+            lrc_high = bands["lrc_high"].reindex(out.index, method="ffill")
+            lrc_low  = bands["lrc_low"].reindex(out.index, method="ffill")
+            above = out["close"] > lrc_high
+            below = out["close"] < lrc_low
+            long_raw  = long_raw  & above
+            short_raw = short_raw & below
 
     if regime_filter == "long-only":
         short_raw = pd.Series(False, index=out.index)
@@ -218,11 +225,11 @@ def _consecutive_streaks(win_flags: pd.Series) -> Tuple[int, int]:
             cur_w = 0
     return max_w, max_l
 
-# ---------- Backtest ----------
+# ---------- Backtest (TP daima 2×SL) ----------
 def backtest(df: pd.DataFrame,
-             stop_type: str = "Swing",
-             tp_percent: float = 10.0,
-             rr: float = 2.0,
+             stop_type: str = "Swing",     # "Swing" | "ATR"
+             tp_percent: float = 10.0,     # (ARTIK KULLANILMIYOR)
+             rr: float = 2.0,              # (ARTIK KULLANILMIYOR, sabit 2)
              atr_stop_mult: float = 2.0,
              entry_offset_bps: float = 0.0,
              fee_rate: float = 0.0004,
@@ -233,6 +240,7 @@ def backtest(df: pd.DataFrame,
              leverage: float = 10.0,
              swing_lookback: int = 10,
              pip_size: float = 0.01) -> Tuple[pd.DataFrame, dict, pd.DataFrame]:
+
     o, h, l, c = df["open"], df["high"], df["low"], df["close"]
     atrv = df.get("ATR", pd.Series(index=df.index, dtype=float)).fillna(method="ffill")
     long_sig  = df["long_signal"].fillna(False)
@@ -270,22 +278,20 @@ def backtest(df: pd.DataFrame,
                     side = "long"
                     if stop_type == "Swing":
                         swing_low = _last_swing_low(h, l, lookback=swing_lookback)
-                        sl = max(0.0, swing_low - pip_size)
-                        tp = ent * (1.0 + tp_percent / 100.0)
+                        sl = max(0.0, float(swing_low - pip_size))
                     else:
-                        sl_dist = atrv.iloc[i] * atr_stop_mult
-                        sl = ent - sl_dist
-                        tp = ent + rr * sl_dist
+                        sl = float(ent - atrv.iloc[i] * atr_stop_mult)
+                    dist = max(ent - sl, 0.0)
+                    tp = float(ent + 2.0 * dist)  # **TP = 2×SL mesafesi**
                 else:
                     side = "short"
                     if stop_type == "Swing":
                         swing_high = _last_swing_high(h, l, lookback=swing_lookback)
-                        sl = swing_high + pip_size
-                        tp = ent * (1.0 - tp_percent / 100.0)
+                        sl = float(swing_high + pip_size)
                     else:
-                        sl_dist = atrv.iloc[i] * atr_stop_mult
-                        sl = ent + sl_dist
-                        tp = ent - rr * sl_dist
+                        sl = float(ent + atrv.iloc[i] * atr_stop_mult)
+                    dist = max(sl - ent, 0.0)
+                    tp = float(ent - 2.0 * dist)  # **TP = 2×SL mesafesi**
 
                 entry_price = float(ent)
                 in_pos = True
@@ -372,16 +378,10 @@ with st.sidebar:
 
     st.subheader("Tarih Aralığı")
     default_range = (date(2020, 1, 1), date.today())
-    date_range = st.date_input(
-        "İşlem aralığı (UTC)",
-        value=default_range,
-        help="Başlangıç ve bitiş tarihi seçiniz"
-    )
+    date_range = st.date_input("İşlem aralığı (UTC)", value=default_range, help="Başlangıç ve bitiş tarihi seçiniz")
 
     st.subheader("Opsiyonel LRC Filtre")
     use_lrc = st.checkbox("LRC filtresi (1D LRC-300)", value=False)
-    allow_long = st.checkbox("LRC long yalnız", value=True)
-    allow_short = st.checkbox("LRC short yalnız", value=True)
 
     st.subheader("Grafik Overlay")
     show_ema = st.checkbox("Grafikte EMA(7/13/26) çizgilerini göster", value=False)
@@ -391,10 +391,11 @@ with st.sidebar:
 
     st.subheader("Stop / Hedef Ayarları")
     stop_type = st.selectbox("Stop Tipi", ["Swing","ATR"], index=0)
-    tp_percent = st.slider("TP % (Swing için)", min_value=1, max_value=50, value=10, step=1)
-    rr = st.number_input("Risk/Ödül (TP/SL) [ATR için]", 0.5, 10.0, 2.0, 0.1)
+    tp_percent = st.slider("TP % (devre dışı, bilgi)", min_value=1, max_value=50, value=10, step=1)
+    rr = st.number_input("Risk/Ödül (devre dışı, bilgi)", 0.5, 10.0, 2.0, 0.1)
     atr_mult = st.number_input("SL = ATR × [ATR için]", 0.5, 10.0, 2.0, 0.1)
     entry_off = st.number_input("Giriş Offset (bps)", 0.0, 100.0, 0.0, 1.0)
+    st.caption("Not: RR sabit **2×**. TP her zaman SL mesafesinin 2 katı olarak hesaplanır; yukarıdaki TP% / RR değerleri gösterim amaçlıdır.")
 
     st.subheader("Sermaye / İşlem")
     init_eq = st.number_input("Başlangıç Sermaye", 100.0, 1_000_000.0, 1000.0, 100.0)
@@ -417,6 +418,7 @@ if run_btn:
         st.error(f"Veri yükleme hatası: {e}")
         st.stop()
 
+    # --- Sembol/timeframe kırp ---
     df_5m_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "5m")].copy()
     df_1h_all = big[(big["symbol"] == wanted_symbol) & (big["timeframe"].str.lower() == "1h")].copy()
     has_1d = any(tf.lower() == "1d" for tf in big["timeframe"].unique())
@@ -426,47 +428,59 @@ if run_btn:
         st.error("5m veya 1h veri yok.")
         st.stop()
 
+    # --- Tarih aralığını sırala + UTC ---
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        start_date = pd.Timestamp(date_range[0], tz="UTC")
-        end_date = pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)
+        a, b = date_range[0], date_range[1]
+        if pd.Timestamp(a) > pd.Timestamp(b):
+            a, b = b, a
+        start_date = pd.Timestamp(a).tz_localize("UTC")
+        end_date = pd.Timestamp(b).tz_localize("UTC") + pd.Timedelta(days=1)
     else:
-        start_date = pd.Timestamp(date_range, tz="UTC")
+        start_date = pd.Timestamp(date_range).tz_localize("UTC")
         end_date = start_date + pd.Timedelta(days=1)
 
+    # --- LRC için geçmiş pad'li 1D veriyi hazırla ---
+    # 1) 1D yoksa 1h -> 1D resample
+    daily_full = df_1d_all.copy()
+    if daily_full.empty:
+        daily_full = resample_1h_to_1d(df_1h_all)
+
+    # 2) Başlangıçtan 400 gün geri pad'li pencere
+    start_ext = (start_date - pd.Timedelta(days=400)).floor("D")
+    daily_ext = daily_full.loc[(daily_full.index >= start_ext) & (daily_full.index < end_date)].copy()
+    # güvenlik: indeks temizle
+    daily_ext = daily_ext.sort_index()
+    daily_ext = daily_ext[~daily_ext.index.duplicated(keep="last")]
+
+    # --- 5m/1h: seçilen aralığa kırp ---
     df_5m = df_5m_all.loc[(df_5m_all.index >= start_date) & (df_5m_all.index < end_date)].copy().sort_index()
     df_1h = df_1h_all.loc[(df_1h_all.index >= start_date) & (df_1h_all.index < end_date)].copy().sort_index()
-    df_1d = df_1d_all.loc[(df_1d_all.index >= start_date) & (df_1d_all.index < end_date)].copy().sort_index() if has_1d else pd.DataFrame()
-
     df_5m = df_5m[~df_5m.index.duplicated(keep="last")]
     df_1h = df_1h[~df_1h.index.duplicated(keep="last")]
-    if not df_1d.empty:
-        df_1d = df_1d[~df_1d.index.duplicated(keep="last")]
 
+    # --- Bar kontrolleri (bilgilendirme) ---
+    if use_lrc and len(daily_ext) < 300:
+        st.warning(f"LRC(300) için geçmiş bar {len(daily_ext)}; dataset 300 günden kısa olabilir.")
     if len(df_5m) < 40:
         st.warning("Seçilen aralıkta 5m bar sayısı yetersiz (>= 40 önerilir).")
     if len(df_1h) < 20:
         st.warning("Seçilen aralıkta 1h bar sayısı yetersiz (>= 20 önerilir).")
-    if (use_lrc or show_lrc_overlay):
-        if df_1d.empty:
-            st.warning("LRC kullanılacak/gösterilecek, ancak 1D veri yok.")
-        elif len(df_1d) < 300:
-            st.warning("LRC(300) için 1D bar sayısı yetersiz (>= 300 gerekir).")
 
+    # --- Sinyaller ---
     regime_arg = None if regime == "Hepsi" else regime
     sig = make_signals_5m_with_1h_and_lrc(
-        df_5m, df_1h, df_1d,
+        df_5m, df_1h, daily_ext,
         atr_len=14,
         regime_filter=regime_arg,
-        use_lrc=use_lrc,
-        allow_long=allow_long,
-        allow_short=allow_short
+        use_lrc=use_lrc
     )
 
+    # --- Backtest (TP her zaman 2×SL) ---
     trades, stats, eq = backtest(
         sig,
-        stop_type=stop_type,
-        tp_percent=float(tp_percent),
-        rr=rr,
+        stop_type=st.session_state.get("stop_type", "Swing") if "stop_type" in st.session_state else "Swing",
+        tp_percent=0.0,   # kullanılmıyor
+        rr=2.0,           # sabit 2
         atr_stop_mult=atr_mult,
         entry_offset_bps=entry_off,
         fee_rate=fee,
@@ -479,6 +493,7 @@ if run_btn:
         pip_size=0.01
     )
 
+    # ---- Sonuçlar ----
     c1, c2 = st.columns([2,1])
     with c1:
         st.subheader("Equity Eğrisi (Streamlit)")
@@ -497,6 +512,7 @@ if run_btn:
             "Max Drawdown %": round(stats.get("max_dd", 0.0), 2),
         })
 
+    # ---- Plotly grafikler (dokunmadım) ----
     st.subheader("Equity Eğrisi (Plotly)")
     if not eq.empty:
         fig_eq = go.Figure()
@@ -506,12 +522,8 @@ if run_btn:
 
         csv_buf_eq = io.StringIO()
         eq.reset_index().rename(columns={"index":"time"}).to_csv(csv_buf_eq, index=False)
-        st.download_button(
-            label="Equity CSV indir",
-            data=csv_buf_eq.getvalue().encode("utf-8"),
-            file_name=f"equity_{wanted_symbol}_{dataset_choice}.csv",
-            mime="text/csv"
-        )
+        st.download_button("Equity CSV indir", csv_buf_eq.getvalue().encode("utf-8"),
+                           file_name=f"equity_{wanted_symbol}_{dataset_choice}.csv", mime="text/csv")
 
     st.subheader("Fiyat Grafiği (5m) – Giriş/Çıkış Noktaları")
     if not df_5m.empty:
@@ -521,91 +533,58 @@ if run_btn:
         )])
 
         trades_to_plot = trades.tail(int(plot_n_trades)) if not trades.empty else trades
-
         if not trades_to_plot.empty:
             long_entries = trades_to_plot[trades_to_plot["side"]=="long"][["time","entry"]].dropna()
             short_entries = trades_to_plot[trades_to_plot["side"]=="short"][["time","entry"]].dropna()
-
             if not long_entries.empty:
-                fig.add_trace(go.Scatter(
-                    x=long_entries["time"], y=long_entries["entry"],
-                    mode="markers", name="Long Entry",
-                    marker=dict(symbol="triangle-up", size=9, color="green")
-                ))
+                fig.add_trace(go.Scatter(x=long_entries["time"], y=long_entries["entry"], mode="markers",
+                                         name="Long Entry", marker=dict(symbol="triangle-up", size=9, color="green")))
             if not short_entries.empty:
-                fig.add_trace(go.Scatter(
-                    x=short_entries["time"], y=short_entries["entry"],
-                    mode="markers", name="Short Entry",
-                    marker=dict(symbol="triangle-down", size=9, color="red")
-                ))
-
+                fig.add_trace(go.Scatter(x=short_entries["time"], y=short_entries["entry"], mode="markers",
+                                         name="Short Entry", marker=dict(symbol="triangle-down", size=9, color="red")))
             if "exit_time" in trades_to_plot.columns:
                 exits = trades_to_plot.dropna(subset=["exit_time","exit","net"])
                 if not exits.empty:
                     win_exits = exits[exits["net"] > 0]
                     loss_exits = exits[exits["net"] <= 0]
                     if not win_exits.empty:
-                        fig.add_trace(go.Scatter(
-                            x=win_exits["exit_time"], y=win_exits["exit"],
-                            mode="markers", name="Exit (Win)",
-                            marker=dict(symbol="x", size=9, color="green")
-                        ))
+                        fig.add_trace(go.Scatter(x=win_exits["exit_time"], y=win_exits["exit"],
+                                                 mode="markers", name="Exit (Win)",
+                                                 marker=dict(symbol="x", size=9, color="green")))
                     if not loss_exits.empty:
-                        fig.add_trace(go.Scatter(
-                            x=loss_exits["exit_time"], y=loss_exits["exit"],
-                            mode="markers", name="Exit (Loss)",
-                            marker=dict(symbol="x", size=9, color="red")
-                        ))
-
-            if draw_tp_sl:
+                        fig.add_trace(go.Scatter(x=loss_exits["exit_time"], y=loss_exits["exit"],
+                                                 mode="markers", name="Exit (Loss)",
+                                                 marker=dict(symbol="x", size=9, color="red")))
+            if draw_tp_sl and not trades_to_plot.empty:
                 for _, tr in trades_to_plot.iterrows():
-                    x0 = tr["time"]
-                    x1 = tr.get("exit_time", x0)
-                    if pd.isna(x1):
-                        x1 = x0 + pd.Timedelta(minutes=30)
+                    x0 = tr["time"]; x1 = tr.get("exit_time", x0 + pd.Timedelta(minutes=30))
                     if "tp" in tr and not pd.isna(tr["tp"]):
-                        fig.add_trace(go.Scatter(
-                            x=[x0, x1], y=[tr["tp"], tr["tp"]],
-                            mode="lines", name="TP",
-                            line=dict(dash="dot", width=1, color="green"),
-                            showlegend=False
-                        ))
+                        fig.add_trace(go.Scatter(x=[x0, x1], y=[tr["tp"], tr["tp"]], mode="lines",
+                                                 line=dict(dash="dot", width=1, color="green"), showlegend=False))
                     if "sl" in tr and not pd.isna(tr["sl"]):
-                        fig.add_trace(go.Scatter(
-                            x=[x0, x1], y=[tr["sl"], tr["sl"]],
-                            mode="lines", name="SL",
-                            line=dict(dash="dot", width=1, color="red"),
-                            showlegend=False
-                        ))
-
+                        fig.add_trace(go.Scatter(x=[x0, x1], y=[tr["sl"], tr["sl"]], mode="lines",
+                                                 line=dict(dash="dot", width=1, color="red"), showlegend=False))
         if show_ema and {"ema_f","ema_m","ema_s"}.issubset(sig.columns):
             fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_f"], mode="lines", name="EMA 7"))
             fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_m"], mode="lines", name="EMA 13"))
             fig.add_trace(go.Scatter(x=sig.index, y=sig["ema_s"], mode="lines", name="EMA 26"))
-
-        if show_lrc_overlay and not df_1d.empty:
-            bands = cached_lrc_bands(df_1d, length=300)
+        if show_lrc_overlay and not daily_ext.empty:
+            bands = cached_lrc_bands(daily_ext, length=300)
             if not bands.empty:
                 lrc_high = bands["lrc_high"].reindex(df_5m.index, method="ffill")
                 lrc_low  = bands["lrc_low"].reindex(df_5m.index, method="ffill")
                 fig.add_trace(go.Scatter(x=df_5m.index, y=lrc_high, mode="lines", name="LRC High (1D→5m)"))
                 fig.add_trace(go.Scatter(x=df_5m.index, y=lrc_low,  mode="lines", name="LRC Low  (1D→5m)"))
-
         fig.update_layout(height=560, xaxis_title="Time (UTC)", yaxis_title="Price")
         st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Grafik için 5m veri yok.")
 
+    # ---- İşlemler + CSV ----
     st.subheader("İşlemler")
     if not trades.empty:
         st.dataframe(trades.tail(200), use_container_width=True)
         csv_buf = io.StringIO()
         trades.to_csv(csv_buf, index=False)
-        st.download_button(
-            label="İşlemleri CSV indir",
-            data=csv_buf.getvalue().encode("utf-8"),
-            file_name=f"trades_{wanted_symbol}_{dataset_choice}.csv",
-            mime="text/csv"
-        )
+        st.download_button("İşlemleri CSV indir", csv_buf.getvalue().encode("utf-8"),
+                           file_name=f"trades_{wanted_symbol}_{dataset_choice}.csv", mime="text/csv")
     else:
         st.info("İşlem bulunamadı. Parametreleri değiştirip tekrar dene.")
