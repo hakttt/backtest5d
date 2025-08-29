@@ -20,7 +20,7 @@ from typing import Tuple
 from datetime import date
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="BTC/ETH Backtest (Dropbox Parquet)", layout="wide")
+st.set_page_config(page_title="BTC/ETH Futures Backtest (Dropbox Parquet)", layout="wide")
 
 # ----- Varsayılan FUTURES linki -----
 DEFAULT_FUTURES_URL = (
@@ -39,7 +39,7 @@ def to_direct_link(url: str) -> str:
         url = url.replace("dl=0", "dl=1")
     return url
 
-def stream_download(url: str, dst_path: str, chunk=1024*1024, timeout=120):
+def stream_download(url: str, dst_path: str, chunk=1024*1024, timeout=180):
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         with open(dst_path, "wb") as f:
@@ -48,7 +48,13 @@ def stream_download(url: str, dst_path: str, chunk=1024*1024, timeout=120):
                     f.write(part)
 
 def ensure_local_copy(name: str, url: str) -> str:
-    local_path = os.path.join(DATA_DIR, name)
+    """
+    URL değiştiğinde eski cache kullanılmasın diye URL hash'ini dosya adına ekler.
+    """
+    base, ext = os.path.splitext(name)
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:10]
+    local_name = f"{base}_{url_hash}{ext or '.parquet'}"
+    local_path = os.path.join(DATA_DIR, local_name)
     if not os.path.exists(local_path):
         direct = to_direct_link(url)
         stream_download(direct, local_path)
@@ -116,7 +122,7 @@ def cached_lrc_bands(df_1d: pd.DataFrame, length: int = 300) -> pd.DataFrame:
     df_1d = df_1d.sort_index()
     df_1d = df_1d[~df_1d.index.duplicated(keep="last")]
     key = (str(df_1d.index.min()) + str(df_1d.index.max()) + str(float(df_1d["close"].sum())))
-    _ = hashlib.md5(key.encode()).hexdigest()  # cache param güvenlik
+    _ = hashlib.md5(key.encode()).hexdigest()
     return compute_lrc_bands(df_1d, length=length)
 
 # ---------- 5m + 1h EMA + Opsiyonel LRC ----------
